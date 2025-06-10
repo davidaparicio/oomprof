@@ -45619,11 +45619,11 @@ struct pt_regs {
 	long unsigned int r10;
 	long unsigned int r9;
 	long unsigned int r8;
-	long unsigned int rax;
+	long unsigned int ax;
 	long unsigned int cx;
 	long unsigned int dx;
 	long unsigned int si;
-	long unsigned int rdi;
+	long unsigned int di;
 	long unsigned int orig_ax;
 	long unsigned int ip;
 	union {

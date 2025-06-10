@@ -4,14 +4,24 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
+	"os"
 	"runtime"
 	"strconv"
 	"strings"
 )
 
+func main() {
+	// Enable memory profiling for this process
+	runtime.MemProfile(nil, false)
+	fmt.Println("oomer")
+	checkSwap()
+	_, i := getSystemMemory()
+	fmt.Println("memory: ", i)
+	bigAlloc(i)
+}
+
 func checkSwap() {
-	content, err := ioutil.ReadFile("/proc/swaps")
+	content, err := os.ReadFile("/proc/swaps")
 	if err != nil {
 		panic("Could not read /proc/swaps")
 	}
@@ -33,7 +43,7 @@ func getSystemMemory() (int64, int64) {
 	availableSystem := int64(0)
 
 	// Linux-specific approach using /proc/meminfo
-	content, err := ioutil.ReadFile("/proc/meminfo")
+	content, err := os.ReadFile("/proc/meminfo")
 	if err == nil {
 		lines := strings.Split(string(content), "\n")
 		for _, line := range lines {
@@ -68,10 +78,8 @@ func getSystemMemory() (int64, int64) {
 	return totalSystem, availableSystem
 }
 
-func main() {
-	checkSwap()
+func bigAlloc(i int64) {
 	var space []byte
-	_, i := getSystemMemory()
 
 	// Try to allocate memory, reducing size if allocation fails
 	for space == nil && i > 0 {
@@ -80,7 +88,7 @@ func main() {
 			defer func() {
 				if r := recover(); r != nil {
 					fmt.Printf("Failed to allocate %d bytes, trying a smaller size\n", i)
-					i = i - 1000
+					i = i - 4096
 				}
 			}()
 
@@ -101,5 +109,6 @@ func main() {
 		space[k] = byte(k & 255)
 	}
 
-	fmt.Println("Memory filled. Should have oomed ...")
+	fmt.Println("Memory filled. Should have oomed, going for more ...")
+	bigAlloc(i / 2)
 }
