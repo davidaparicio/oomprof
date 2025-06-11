@@ -22,7 +22,7 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/libpf/pfelf"
 )
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target amd64 -tags linux bpf ../oomprof.c
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target $GOARCH -tags linux bpf ../oomprof.c
 
 const (
 	lowMemEvent = iota
@@ -36,9 +36,9 @@ func SetupOomProf(ctx context.Context) error {
 		return ctx.Err()
 	default:
 	}
-	
+
 	log.Println("Starting BPF object loading...")
-	
+
 	// Allow the current process to lock memory for eBPF resources.
 	if err := rlimit.RemoveMemlock(); err != nil {
 		return err
@@ -53,7 +53,7 @@ func SetupOomProf(ctx context.Context) error {
 			LogSizeStart: 1024 * 1024,
 		},
 	}
-	
+
 	// Load BPF objects - this is the slow part that might get stuck
 	loadStart := time.Now()
 	if err := loadBpfObjects(&objs, &opts); err != nil {
@@ -107,7 +107,7 @@ func SetupOomProf(ctx context.Context) error {
 	go monitorEventMap(ctx, &objs.bpfMaps)
 
 	log.Println("Starting main monitoring loop...")
-	
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -196,13 +196,13 @@ func monitorEventMap(ctx context.Context, maps *bpfMaps) {
 		return
 	}
 	defer eventReader.Close()
-	
+
 	// Close reader when context is cancelled
 	go func() {
 		<-ctx.Done()
 		eventReader.Close()
 	}()
-	
+
 	for {
 		var pid uint32
 		select {

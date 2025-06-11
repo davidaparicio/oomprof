@@ -6,6 +6,9 @@
 // bpftool btf dump file /sys/kernel/btf/vmlinux format c > include/vmlinux.h
 #include "include/vmlinux.h"
 
+// ARM64 compatibility definitions
+#include "include/arm64_compat.h"
+
 #include "include/bpf_core_read.h"
 #include "include/bpf_helpers.h"
 #include "include/bpf_tracing.h"
