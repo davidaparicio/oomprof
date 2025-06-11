@@ -10,6 +10,14 @@
 #include "include/bpf_helpers.h"
 #include "include/bpf_tracing.h"
 
+// Override bpf_printk to always use bpf_trace_printk for compatibility with older kernels
+#undef bpf_printk
+#define bpf_printk(fmt, args...) \
+({ \
+	char ____fmt[] = fmt; \
+	bpf_trace_printk(____fmt, sizeof(____fmt), ##args); \
+})
+
 #define MAX_STACK_DEPTH 64
 
 char __license[] SEC("license") = "Dual MIT/GPL";
@@ -44,8 +52,8 @@ struct BadnessRecord {
 };
 
 struct GoProc {
-  u64 mbuckets;
-  u32 num_buckets;
+  u64 mbuckets; // static doesn't change
+  u32 num_buckets;  // updated after each profile is recorded
 };
 
 struct Event {
@@ -53,6 +61,7 @@ struct Event {
     u32 payload;
 };
 
+// CPU local scratch for communication between oom kprobes
 struct {
   __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
   __type(key, int);
@@ -62,7 +71,7 @@ struct {
 
 struct {
   __uint(type, BPF_MAP_TYPE_ARRAY);
-  __type(key ,u32);
+  __type(key, u32);
   __type(value, struct gobucket);
   // This is probably way too big, but we can always reduce it later.
   __uint(max_entries, 179999);
@@ -76,7 +85,7 @@ struct {
   __uint(max_entries, 1024);
 } go_procs SEC(".maps");
 
-// Map
+// Global entry for the pid of the process we are profiling, key always 0
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
   __type(key, u32);
@@ -139,6 +148,7 @@ record_profile_buckets(struct BadnessRecord *br, pid_t pid) {
 
   bpf_printk("found %d gobuckets\n", i);
   gop->num_buckets = i;
+
   return 0;
 }
 
@@ -151,8 +161,10 @@ int BPF_KPROBE(oom_kill_process_handler) {
     return 0;
   }
 
-  bpf_printk("oom_kill_process_handler: canary pid: %d, score: %d, target pid: %d, score: %d\n",
-             br->canary_pid, br->canary_score, br->target_pid, br->target_score);
+  bpf_printk("oom_kill_process_handler: canary pid: %d, score: %d\n",
+             br->canary_pid, br->canary_score);
+  bpf_printk("  target pid: %d, score: %d\n",
+             br->target_pid, br->target_score);
 
   // We have an opportunity here to record the profile but probably better to let
   // the kernel proceed and nuke the canary and do it outside the oom context.
@@ -169,7 +181,15 @@ int BPF_KPROBE(oom_kill_process_handler) {
   // if (__kernel__ > 6.13) {
   //   bpf_send_signal(...)
   // }
-  bpf_map_update_elem(&profile_pid, &key, &br->target_pid, 0);
+  pid_t *target_pid = bpf_map_lookup_elem(&profile_pid, &key);
+  if (!target_pid) {
+    bpf_printk("profile_pid lookup failed\n");
+    return 0;
+  }
+  if (*target_pid != 0) {
+    bpf_printk("oom_kill_process_handler: target pid already set: %d\n", *target_pid);
+    return 0;
+  }
   if (br->target_pid != 0) {
     bpf_printk("oom_kill_process_probe triggering target pid event: %d\n", br->target_pid);
     struct Event ev = { .event_type = 0, .payload = br->target_pid};
@@ -198,11 +218,11 @@ int BPF_KRETPROBE(oom_badness_return, int score) {
     return 0;
   }
   struct task_struct *task = (struct task_struct*)br->current_task;
-  pid_t pid = BPF_CORE_READ(task, tgid);
   if (!task) {
     bpf_printk("current_task is null\n");
     return 0;
   }
+  pid_t pid = BPF_CORE_READ(task, tgid);
   if (br->canary_score < score) {
     if (br->target_score < br->canary_score) {
       bpf_printk("moved canary to target, score: %d, pid: %d\n", br->canary_score, br->canary_pid);
@@ -210,12 +230,14 @@ int BPF_KRETPROBE(oom_badness_return, int score) {
       br->target_score = br->canary_score;
       br->target_task = br->canary_task;
     }
-    bpf_printk("canary score %d->%d, pid: %d->%d\n", br->canary_score, score, br->canary_pid, pid);
+    bpf_printk("canary score %d->%d\n", br->canary_score, score);
+    bpf_printk("  canary pid: %d->%d\n", br->canary_pid, pid);
     br->canary_pid = pid;
     br->canary_score = score;
     br->canary_task = (u64)task;
   } else if (br->target_score < score) {
-    bpf_printk("target score %d->%d, pid: %d->%d\n", br->target_score, score, br->target_pid, pid);
+    bpf_printk("target score %d->%d\n", br->target_score, score);
+    bpf_printk("  target pid: %d->%d\n", br->target_pid, pid);
     br->target_pid = pid;
     br->target_score = score;
     br->target_task = (u64)task;
@@ -223,14 +245,18 @@ int BPF_KRETPROBE(oom_badness_return, int score) {
   return 0;
 }
 
-SEC("kretprobe/complete_signal")
-int BPF_KRETPROBE(signal_probe) {
+
+// There's no scheduler tracepoint that runs in the the target process address space
+// so we use signals instead.
+SEC("tracepoint/signal/signal_deliver")
+int signal_probe(void *ctx) {
   pid_t pid = bpf_get_current_pid_tgid() >> 32;
   int key = 0;
   pid_t *target_pid = bpf_map_lookup_elem(&profile_pid, &key);
-  if (!target_pid) {
+  if (!target_pid || target_pid == 0) {
     return 0;
   }
+  //bpf_printk("signal_probe: current pid: %d, target pid: %d\n", pid, *target_pid);
   if (*target_pid != pid) {
     return 0;
   }

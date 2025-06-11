@@ -29,7 +29,16 @@ const (
 	profileEvent
 )
 
-func SetupOomProf() error {
+func SetupOomProf(ctx context.Context) error {
+	// Check context before starting
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	
+	log.Println("Starting BPF object loading...")
+	
 	// Allow the current process to lock memory for eBPF resources.
 	if err := rlimit.RemoveMemlock(); err != nil {
 		return err
@@ -44,14 +53,17 @@ func SetupOomProf() error {
 			LogSizeStart: 1024 * 1024,
 		},
 	}
+	
+	// Load BPF objects - this is the slow part that might get stuck
+	loadStart := time.Now()
 	if err := loadBpfObjects(&objs, &opts); err != nil {
 		var verr *ebpf.VerifierError
 		if errors.As(err, &verr) {
 			fmt.Printf("%+v\n", verr)
 		}
-		log.Fatalf("loading objects: %v", err)
-		return err
+		return fmt.Errorf("loading objects: %v", err)
 	}
+	log.Printf("BPF objects loaded in %v", time.Since(loadStart))
 	defer objs.Close()
 
 	kp1, err := link.Kprobe("oom_badness", objs.OomBadnessEntry, nil)
@@ -72,49 +84,127 @@ func SetupOomProf() error {
 	}
 	defer kp3.Close()
 
-	sigKprobe, err := link.Kretprobe("complete_signal", objs.SignalProbe, nil)
+	// sigKprobe, err := link.Kretprobe("complete_signal", objs.SignalProbe, nil)
+	// if err != nil {
+	// 	log.Fatalf("linking kprobe: %v", err)
+	// }
+	// defer sigKprobe.Close()
+	schedSwitch, err := link.Tracepoint("signal", "signal_deliver", objs.SignalProbe, nil)
 	if err != nil {
-		log.Fatalf("linking kprobe: %v", err)
+		return fmt.Errorf("linking tracepoint: %v", err)
 	}
-	defer sigKprobe.Close()
+	defer schedSwitch.Close()
+
+	// All BPF objects are now loaded successfully
+	log.Println("All BPF probes attached successfully")
 
 	// add verbose flag
-	go readTracePipe(context.Background())
+	go readTracePipe(ctx)
 
 	// Fixme: remove entries when process goes away
 	seenMap := make(map[uint32]int64)
 
-	go monitorEventMap(context.Background(), objs.bpfMaps.SignalEvents, objs.bpfMaps.GoProcs)
+	go monitorEventMap(ctx, &objs.bpfMaps)
 
+	log.Println("Starting main monitoring loop...")
+	
 	for {
-		newProcs, err := scanGoProcesses(seenMap)
-		if err != nil {
-			return err
-		}
-		// Display the results
-		for _, p := range newProcs {
-			// update go_procs map
-			goProc := bpfGoProc{
-				Mbuckets: p.MBucketsAddr,
-			}
-			if err := objs.GoProcs.Put(p.PID, &goProc); err != nil {
-				log.Printf("error putting PID %d into go_procs map: %v", p.PID, err)
+		select {
+		case <-ctx.Done():
+			log.Println("Context cancelled, shutting down SetupOomProf")
+			return ctx.Err()
+		default:
+			newProcs, err := scanGoProcesses(ctx, seenMap)
+			if err != nil {
 				return err
 			}
+			// Display the results
+			for _, p := range newProcs {
+				// update go_procs map
+				goProc := bpfGoProc{
+					Mbuckets: p.MBucketsAddr,
+				}
+				if err := objs.GoProcs.Put(p.PID, &goProc); err != nil {
+					log.Printf("error putting PID %d into go_procs map: %v", p.PID, err)
+					return err
+				}
+			}
+			// sleep for a second with context check
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(1 * time.Second):
+			}
 		}
-		// sleep for a second
-		time.Sleep(1 * time.Second)
 	}
 }
 
-func monitorEventMap(ctx context.Context, m *ebpf.Map, goProcs *ebpf.Map) {
-	eventReader, err := perf.NewReader(m, 1)
-	if err != nil {
-		log.Fatalf("error creating perf reader: %v", err)
+func readProfile(maps *bpfMaps, numBuckets uint32) error {
+	const maxBatchSize = uint32(32) // Adjust based on your needs and kernel limits
+
+	var allBuckets []bpfGobucket
+	var cursor ebpf.MapBatchCursor
+
+	// Process buckets in batches
+	for start := uint32(0); start < numBuckets; start += maxBatchSize {
+		// Calculate batch size
+		batchSize := maxBatchSize
+		if start+batchSize > numBuckets {
+			batchSize = numBuckets - start
+		}
+
+		// Prepare keys and values for batch lookup
+		keys := make([]uint32, batchSize)
+		values := make([]bpfGobucket, batchSize)
+
+		for i := uint32(0); i < batchSize; i++ {
+			keys[i] = start + i
+		}
+
+		// Batch lookup
+		count, err := maps.MemBuckets.BatchLookup(&cursor, keys, values, nil)
+		if err != nil {
+			return fmt.Errorf("batch lookup failed at offset %d: %v", start, err)
+		}
+
+		// Add retrieved buckets to our collection
+		allBuckets = append(allBuckets, values[:count]...)
+
+		// If we got fewer buckets than requested, we've reached the end
+		if count < int(batchSize) {
+			break
+		}
 	}
-	var data perf.Record
+
+	// Process the retrieved buckets
+	log.Printf("Retrieved %d buckets out of %d", len(allBuckets), numBuckets)
+
+	// TODO: Process the buckets as needed (e.g., format as pprof, analyze, etc.)
+	for i, bucket := range allBuckets {
+		if bucket.Size > 0 {
+			log.Printf("Bucket %d: size=%d, nstk=%d, hash=%x", i, bucket.Size, bucket.Nstk, bucket.Hash)
+		}
+	}
+
+	return nil
+}
+
+func monitorEventMap(ctx context.Context, maps *bpfMaps) {
+	eventReader, err := perf.NewReader(maps.SignalEvents, 1)
+	if err != nil {
+		log.Printf("error creating perf reader: %v", err)
+		return
+	}
+	defer eventReader.Close()
+	
+	// Close reader when context is cancelled
+	go func() {
+		<-ctx.Done()
+		eventReader.Close()
+	}()
+	
 	for {
-		pid := 0
+		var pid uint32
 		select {
 		case <-ctx.Done():
 			return
@@ -139,14 +229,25 @@ func monitorEventMap(ctx context.Context, m *ebpf.Map, goProcs *ebpf.Map) {
 			}
 			switch ev.EventType {
 			case profileEvent:
-				pid = int(ev.Payload)
+				pid = ev.Payload
 				log.Println("Received profile event for PID:", pid)
 				// Read pprof data
 
+				var gop bpfGoProc
+				if err := maps.GoProcs.Lookup(pid, &gop); err != nil {
+					log.Printf("error getting PID %d from go_procs map: %v", pid, err)
+					continue
+				}
+				log.Printf("Found Go process with PID %d with %d buckets", pid, gop.NumBuckets)
+				if err := readProfile(maps, gop.NumBuckets); err != nil {
+					log.Printf("error reading profile for PID %d: %v", pid, err)
+				} else {
+					log.Printf("Successfully read profile for PID %d", pid)
+				}
 			case lowMemEvent:
-				pid = int(ev.Payload)
+				pid = ev.Payload
 				// Send SIGUSR1 signal to the target process
-				if err := syscall.Kill(pid, syscall.SIGUSR1); err != nil {
+				if err := syscall.Kill(int(pid), syscall.SIGUSR1); err != nil {
 					log.Printf("Failed to send SIGUSR1 to PID %d: %v", pid, err)
 				} else {
 					log.Printf("Successfully sent SIGUSR1 to PID %d", pid)
@@ -154,16 +255,12 @@ func monitorEventMap(ctx context.Context, m *ebpf.Map, goProcs *ebpf.Map) {
 			}
 		}
 
-		if err := goProcs.Lookup(pid, &data); err != nil {
-			log.Printf("error getting PID %d from go_procs map: %v", pid, err)
-			continue
-		}
 	}
 }
 
 // scanGoProcesses scans the /proc filesystem for running Go processes
 // and returns a slice of GoProcessInfo structs with PID and mbuckets address
-func scanGoProcesses(goProcs map[uint32]int64) ([]GoProcessInfo, error) {
+func scanGoProcesses(ctx context.Context, goProcs map[uint32]int64) ([]GoProcessInfo, error) {
 	var results []GoProcessInfo
 
 	// Open /proc directory
@@ -181,6 +278,12 @@ func scanGoProcesses(goProcs map[uint32]int64) ([]GoProcessInfo, error) {
 
 	// Iterate through all entries in /proc
 	for _, entry := range entries {
+		// Check for context cancellation
+		select {
+		case <-ctx.Done():
+			return results, ctx.Err()
+		default:
+		}
 		// We're only interested in directories with numeric names (PIDs)
 		if !entry.IsDir() {
 			continue
@@ -243,7 +346,7 @@ func scanGoProcesses(goProcs map[uint32]int64) ([]GoProcessInfo, error) {
 		}
 
 		goProcs[uint32(pid)] = int64(mbucketsAddr.Address)
-		fmt.Printf("Found Go program with PID %d mbuckets: %x %s\n", pid, mbucketsAddr.Address, cmdlineStr)
+		log.Printf("Found Go program with PID %d mbuckets: %x %s\n", pid, mbucketsAddr.Address, cmdlineStr)
 		// Create a GoProcessInfo struct and add it to our results
 		procInfo := GoProcessInfo{
 			PID:          uint32(pid),

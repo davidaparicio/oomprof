@@ -4,12 +4,19 @@ AMD64_KERNELS = 5.4.276 5.10.217 5.15.159 6.1.91 6.6.31 6.8.10 6.9.1 6.12.16
 ARM64_KERNELS = 6.6.31 6.8.4 6.9.1 6.12.16
 
 GO_TAGS = osusergo,netgo,static_build
+GO_ARCH ?= $(shell uname -m | sed 's/x86_64/amd64/g' | sed 's/aarch64/arm64/g')
+
+lint:
+	go run github.com/golangci/golangci-lint/cmd/golangci-lint@latest run
+
+clean:
+	rm -f oompa.taux oomer.taux oomprof/bpf_*.* *.test
 
 all:
 	go generate ./oomprof
-	go build -tags $(GO_TAGS) -ldflags='-extldflags=-static' -o oompa.taux .
-	go test -tags $(GO_TAGS) -ldflags='-extldflags=-static' -c ./oomprof
-	go build -tags $(GO_TAGS) -ldflags='-extldflags=-static' -o ./oomer.taux ./test
+	GOARCH=$(GO_ARCH) go build -tags $(GO_TAGS) -ldflags='-extldflags=-static' -o oompa.taux .
+	GOARCH=$(GO_ARCH) go test -tags $(GO_TAGS) -ldflags='-extldflags=-static' -c ./oomprof
+	GOARCH=$(GO_ARCH) go build -tags $(GO_TAGS) -ldflags='-extldflags=-static' -o ./oomer.taux ./test
 
 arm64-kernels:
 	@DEST=ci-kernels-arm64; \

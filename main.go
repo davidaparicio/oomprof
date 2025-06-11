@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"runtime"
@@ -15,9 +16,13 @@ func main() {
 	runtime.MemProfile(nil, false)
 	if len(os.Args) > 1 && os.Args[1] == "--canary" {
 		fmt.Println("starting canary subprocess")
-		oomprof.Canary(10)
+		// Allocate 1% of system memory as ballast
+		oomprof.Canary(1.0)
 		// never returns...
 	}
-	oomprof.LaunchOOMCanary()
-	oomprof.SetupOomProf()
+	oomprof.LaunchOOMCanary(os.Args[0])
+	if err := oomprof.SetupOomProf(context.Background()); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to setup OOM profiler: %v\n", err)
+		os.Exit(1)
+	}
 }
