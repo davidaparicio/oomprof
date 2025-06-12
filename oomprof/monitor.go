@@ -10,15 +10,18 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/perf"
 	"github.com/cilium/ebpf/rlimit"
+	"github.com/google/pprof/profile"
 	"go.opentelemetry.io/ebpf-profiler/libpf/pfelf"
 )
 
@@ -50,39 +53,65 @@ func SetupOomProf(ctx context.Context) error {
 		Programs: ebpf.ProgramOptions{
 			// Set the log level to 1 to get more information about the loading process.
 			LogLevel:     ebpf.LogLevelBranch | ebpf.LogLevelInstruction | ebpf.LogLevelStats,
-			LogSizeStart: 1024 * 1024,
+			LogSizeStart: 10 * 1024 * 1024, // Increased to 10MB
 		},
 	}
 
 	// Load BPF objects - this is the slow part that might get stuck
 	loadStart := time.Now()
 	if err := loadBpfObjects(&objs, &opts); err != nil {
+		// Try to find VerifierError in the error chain
 		var verr *ebpf.VerifierError
 		if errors.As(err, &verr) {
-			fmt.Printf("%+v\n", verr)
+			fmt.Printf("Verifier error details:\n%+v\n", verr)
+		} else {
+			// Try unwrapping the error
+			fmt.Printf("BPF load error: %+v\n", err)
+			// Check each level of the error chain
+			currentErr := err
+			for i := 0; i < 10; i++ {
+				currentErr = errors.Unwrap(currentErr)
+				if currentErr == nil {
+					break
+				}
+				if errors.As(currentErr, &verr) {
+					fmt.Printf("Found VerifierError at level %d:\n%+v\n", i+1, verr)
+					break
+				}
+			}
 		}
 		return fmt.Errorf("loading objects: %v", err)
 	}
 	log.Printf("BPF objects loaded in %v", time.Since(loadStart))
-	defer objs.Close()
+
+	// Initialize profile_pid map with key 0 and value 0
+	var key uint32 = 0
+	var pidValue int32 = 0
+	if err := objs.ProfilePid.Put(key, pidValue); err != nil {
+		objs.Close()
+		return fmt.Errorf("initializing profile_pid map: %w", err)
+	}
 
 	kp1, err := link.Kprobe("oom_badness", objs.OomBadnessEntry, nil)
 	if err != nil {
+		objs.Close()
 		return err
 	}
-	defer kp1.Close()
 
 	kp2, err := link.Kretprobe("oom_badness", objs.OomBadnessReturn, nil)
 	if err != nil {
+		kp1.Close()
+		objs.Close()
 		return err
 	}
-	defer kp2.Close()
 
 	kp3, err := link.Kprobe("oom_kill_process", objs.OomKillProcessHandler, nil)
 	if err != nil {
+		kp2.Close()
+		kp1.Close()
+		objs.Close()
 		return err
 	}
-	defer kp3.Close()
 
 	// sigKprobe, err := link.Kretprobe("complete_signal", objs.SignalProbe, nil)
 	// if err != nil {
@@ -91,9 +120,16 @@ func SetupOomProf(ctx context.Context) error {
 	// defer sigKprobe.Close()
 	schedSwitch, err := link.Tracepoint("signal", "signal_deliver", objs.SignalProbe, nil)
 	if err != nil {
+		kp3.Close()
+		kp2.Close()
+		kp1.Close()
+		objs.Close()
+		var verr *ebpf.VerifierError
+		if errors.As(err, &verr) {
+			fmt.Printf("%+v\n", verr)
+		}
 		return fmt.Errorf("linking tracepoint: %v", err)
 	}
-	defer schedSwitch.Close()
 
 	// All BPF objects are now loaded successfully
 	log.Println("All BPF probes attached successfully")
@@ -108,35 +144,51 @@ func SetupOomProf(ctx context.Context) error {
 
 	log.Println("Starting main monitoring loop...")
 
-	for {
-		select {
-		case <-ctx.Done():
-			log.Println("Context cancelled, shutting down SetupOomProf")
-			return ctx.Err()
-		default:
-			newProcs, err := scanGoProcesses(ctx, seenMap)
-			if err != nil {
-				return err
-			}
-			// Display the results
-			for _, p := range newProcs {
-				// update go_procs map
-				goProc := bpfGoProc{
-					Mbuckets: p.MBucketsAddr,
-				}
-				if err := objs.GoProcs.Put(p.PID, &goProc); err != nil {
-					log.Printf("error putting PID %d into go_procs map: %v", p.PID, err)
-					return err
-				}
-			}
-			// sleep for a second with context check
+	// Run the monitoring loop in a goroutine
+	go func() {
+		// Ensure cleanup happens when context is cancelled
+		defer func() {
+			log.Println("Cleaning up BPF resources")
+			schedSwitch.Close()
+			kp3.Close()
+			kp2.Close()
+			kp1.Close()
+			objs.Close()
+		}()
+
+		for {
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(1 * time.Second):
+				log.Println("Context cancelled, shutting down monitoring loop")
+				return
+			default:
+				newProcs, err := scanGoProcesses(ctx, seenMap)
+				if err != nil {
+					log.Printf("error scanning Go processes: %v", err)
+					continue
+				}
+				// Display the results
+				for _, p := range newProcs {
+					// update go_procs map
+					goProc := bpfGoProc{
+						Mbuckets: p.MBucketsAddr,
+					}
+					if err := objs.GoProcs.Put(p.PID, &goProc); err != nil {
+						log.Printf("error putting PID %d into go_procs map: %v", p.PID, err)
+						continue
+					}
+				}
+				// sleep for a second with context check
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(1 * time.Second):
+				}
 			}
 		}
-	}
+	}()
+
+	return nil
 }
 
 func readProfile(maps *bpfMaps, numBuckets uint32) error {
@@ -179,14 +231,171 @@ func readProfile(maps *bpfMaps, numBuckets uint32) error {
 	// Process the retrieved buckets
 	log.Printf("Retrieved %d buckets out of %d", len(allBuckets), numBuckets)
 
-	// TODO: Process the buckets as needed (e.g., format as pprof, analyze, etc.)
-	for i, bucket := range allBuckets {
-		if bucket.Size > 0 {
-			log.Printf("Bucket %d: size=%d, nstk=%d, hash=%x", i, bucket.Size, bucket.Nstk, bucket.Hash)
+	// Convert to pprof format
+	// TODO: We should get the actual binary path from the process info
+	// For now, assume it's oomer.taux since that's the target process
+	binaryPath := "./oomer.taux"
+	prof, err := bucketsToPprof(allBuckets, binaryPath)
+	if err != nil {
+		return fmt.Errorf("failed to convert buckets to pprof: %v", err)
+	}
+
+	// Write pprof file
+	filename := fmt.Sprintf("oomprof_%d.pb.gz", time.Now().Unix())
+	f, err := os.Create(filename)
+	if err != nil {
+		return fmt.Errorf("failed to create pprof file: %v", err)
+	}
+	defer f.Close()
+
+	if err := prof.Write(f); err != nil {
+		return fmt.Errorf("failed to write pprof file: %v", err)
+	}
+
+	log.Printf("Profile written to %s", filename)
+	return nil
+}
+
+// resolveSymbol uses addr2line to resolve an address to function name and location
+func resolveSymbol(binaryPath string, addr uint64) (string, string, int64) {
+	if binaryPath == "" {
+		return fmt.Sprintf("func_%x", addr), "", 0
+	}
+
+	cmd := exec.Command("addr2line", "-e", binaryPath, "-f", "-C", fmt.Sprintf("0x%x", addr))
+	output, err := cmd.Output()
+	if err != nil {
+		return fmt.Sprintf("func_%x", addr), "", 0
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	if len(lines) >= 2 {
+		funcName := strings.TrimSpace(lines[0])
+		location := strings.TrimSpace(lines[1])
+
+		// Extract line number if available
+		var lineNum int64 = 1
+		if parts := strings.Split(location, ":"); len(parts) >= 2 {
+			if num, err := strconv.ParseInt(parts[1], 10, 64); err == nil {
+				lineNum = num
+			}
+		}
+
+		if funcName != "??" && location != "??:0" {
+			return funcName, location, lineNum
 		}
 	}
 
-	return nil
+	return fmt.Sprintf("func_%x", addr), "", 0
+}
+
+func (b *bpfGobucket) memRecord() *bpfMemRecord {
+	//get a pointer to end of the stk elements
+	return (*bpfMemRecord)(unsafe.Pointer(uintptr(unsafe.Pointer(&b.Stk[0])) + uintptr(b.Header.Nstk*8)))
+}
+
+func bucketsToPprof(buckets []bpfGobucket, binaryPath string) (*profile.Profile, error) {
+	// Create a new pprof profile
+	prof := &profile.Profile{
+		SampleType: []*profile.ValueType{
+			{Type: "alloc_objects", Unit: "count"},
+			{Type: "alloc_space", Unit: "bytes"},
+		},
+		PeriodType: &profile.ValueType{Type: "space", Unit: "bytes"},
+		Period:     1,
+		TimeNanos:  time.Now().UnixNano(),
+	}
+
+	// Track unique locations and functions
+	locationMap := make(map[uint64]*profile.Location)
+	functionMap := make(map[uint64]*profile.Function)
+	nextLocationID := uint64(1)
+	nextFunctionID := uint64(1)
+
+	// Process each bucket
+	for _, bucket := range buckets {
+		mr := bucket.memRecord()
+		allocs, allocBytes := mr.Active.Allocs, mr.Active.AllocBytes
+		for i := 0; i < 3; i++ {
+			allocs += mr.Future[i].Allocs
+			allocBytes += mr.Future[i].AllocBytes
+		}
+		if allocs == 0 {
+			continue
+		}
+
+		// Create locations for the stack trace
+		var locations []*profile.Location
+
+		// Process stack frames (up to nstk)
+		stackLen := int(bucket.Header.Nstk)
+
+		for i := 0; i < stackLen; i++ {
+			addr := bucket.Stk[i]
+			if addr == 0 {
+				break
+			}
+
+			// Check if we already have this location
+			loc, exists := locationMap[addr]
+			if !exists {
+				// Create a new location
+				loc = &profile.Location{
+					ID:      nextLocationID,
+					Address: addr,
+				}
+				nextLocationID++
+
+				// Create a function for this location using symbol resolution
+				fn, fnExists := functionMap[addr]
+				if !fnExists {
+					funcName, location, lineNum := resolveSymbol(binaryPath, addr)
+					fn = &profile.Function{
+						ID:         nextFunctionID,
+						Name:       funcName,
+						SystemName: funcName,
+						Filename:   location,
+						StartLine:  lineNum,
+					}
+					nextFunctionID++
+					functionMap[addr] = fn
+					prof.Function = append(prof.Function, fn)
+				}
+
+				// Add function to location
+				loc.Line = []profile.Line{
+					{
+						Function: fn,
+						Line:     1,
+					},
+				}
+
+				locationMap[addr] = loc
+				prof.Location = append(prof.Location, loc)
+			}
+
+			locations = append(locations, loc)
+		}
+
+		// Create a sample
+		log.Println("Adding sample with allocs:", allocs, "bytes:", allocBytes, "locations:", len(locations))
+		sample := &profile.Sample{
+			Location: locations,
+			Value:    []int64{int64(allocs), int64(allocBytes)}, // count, bytes
+		}
+		prof.Sample = append(prof.Sample, sample)
+	}
+
+	// Sort locations by ID
+	for i := range prof.Location {
+		for j := i + 1; j < len(prof.Location); j++ {
+			if prof.Location[i].ID > prof.Location[j].ID {
+				prof.Location[i], prof.Location[j] = prof.Location[j], prof.Location[i]
+			}
+		}
+	}
+
+	return prof, nil
 }
 
 func monitorEventMap(ctx context.Context, maps *bpfMaps) {
@@ -246,6 +455,8 @@ func monitorEventMap(ctx context.Context, maps *bpfMaps) {
 				}
 			case lowMemEvent:
 				pid = ev.Payload
+				log.Printf("Received lowMemEvent for PID %d", pid)
+
 				// Send SIGUSR1 signal to the target process
 				if err := syscall.Kill(int(pid), syscall.SIGUSR1); err != nil {
 					log.Printf("Failed to send SIGUSR1 to PID %d: %v", pid, err)
@@ -254,7 +465,6 @@ func monitorEventMap(ctx context.Context, maps *bpfMaps) {
 				}
 			}
 		}
-
 	}
 }
 

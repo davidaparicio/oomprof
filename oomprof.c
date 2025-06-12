@@ -31,14 +31,32 @@ struct mapbucket {
   u64 stk[MAX_STACK_DEPTH];
 };
 
-struct gobucket {
+struct memRecordCycle {
+  u64 allocs;
+  u64 frees;
+  u64 allocBytes;
+  u64 freeBytes;
+};
+
+struct memRecord {
+  struct memRecordCycle active;
+  struct memRecordCycle	future[3];
+};
+
+struct gobucket_header {
   u64 next;
   u64 allnext;
   u64 bucketType; // memBucket or blockBucket (includes mutexProfile)
   u64 hash;
   u64 size;
   u64 nstk;
+};
+
+struct gobucket {
+  struct gobucket_header header;
   u64 stk[MAX_STACK_DEPTH];
+  // In Go this structure comes after the stack
+  struct memRecord mem;
 };
 
 struct BadnessRecord {
@@ -64,6 +82,14 @@ struct Event {
     u32 payload;
 };
 
+struct ProfileState {
+    u32 pid;
+    u64 gobp;
+    u32 bucket_count;
+    u32 current_bucket;
+    u32 max_buckets;
+};
+
 // CPU local scratch for communication between oom kprobes
 struct {
   __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -71,6 +97,22 @@ struct {
   __type(value, struct BadnessRecord);
   __uint(max_entries, 1);
 } badness_record SEC(".maps");
+
+// Tail call map for bucket processing
+struct {
+  __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+  __uint(max_entries, 2);
+  __type(key, u32);
+  __type(value, u32);
+} tail_call_map SEC(".maps");
+
+// State for tail call bucket processing
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __type(key, int);
+  __type(value, struct ProfileState);
+  __uint(max_entries, 1);
+} profile_state SEC(".maps");
 
 struct {
   __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -112,6 +154,14 @@ struct {
     __uint(max_entries, 1);
 } dummy_event_map SEC(".maps");
 
+// Dummy map just to export the struct - never actually used
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, u32);
+    __type(value, struct memRecord);  // This forces BTF generation
+    __uint(max_entries, 1);
+} dummy_record_map SEC(".maps");
+
 static inline __attribute__((__always_inline__)) int
 record_profile_buckets(struct BadnessRecord *br, pid_t pid) {
   struct GoProc* gop = bpf_map_lookup_elem(&go_procs, &pid);
@@ -125,13 +175,20 @@ record_profile_buckets(struct BadnessRecord *br, pid_t pid) {
     return 0;
   }
 
-  struct gobucket *gobp = (struct gobucket *)gop->mbuckets;
-  bpf_printk("recording profile buckets for pid: %d mbuckets:%llx\n", pid,
-             gobp);
+  u64 gobp;
+
+  bpf_printk("recording profile buckets for pid: %d mbuckets:%llx\n", pid, gobp);
+  if (bpf_probe_read_user(&gobp, sizeof(void*), (void*)gop->mbuckets)) {
+    bpf_printk("failed to read mbuckets pointer for pid: %d\n", pid);
+    return 0;
+  }
+
+
   u32 i = 0;
-  for (; gobp != NULL; i++) {
-    // Above this hits verifier instruction count limits, maybe need to bpf tail call?
-    if (i > 8000) {
+  for (; gobp != 0; i++) {
+    // Loop limit to avoid verifier issues
+    if (i >= 1000) {
+      bpf_printk("hit 10000 bucket limit\n");
       break;
     }
 
@@ -141,12 +198,32 @@ record_profile_buckets(struct BadnessRecord *br, pid_t pid) {
       bpf_printk("mem_buckets lookup failed %d:%llx\n", i, gobp);
       return 0;
     }
+    // Read the entire bucket structure in one go
+    // This reads: header + MAX_STACK_DEPTH stack slots + memRecord
+    u64 total_size = sizeof(struct gobucket_header) +
+                     (MAX_STACK_DEPTH * sizeof(u64)) +
+                     sizeof(struct memRecord);
 
-    if (bpf_probe_read_user(mbp, sizeof(struct gobucket), gobp)) {
-      bpf_printk("mbuckets lookup failed %d:%llx\n", i, gobp);
-      return 0;
+    if (bpf_probe_read_user(mbp, total_size, (void*)gobp)) {
+      bpf_printk("failed to read full bucket at %llx\n", gobp);
+      break;
     }
-    gobp = (struct gobucket*)mbp->next;
+
+
+    // Skip buckets with stack depth > MAX_STACK_DEPTH
+    if (mbp->header.nstk > MAX_STACK_DEPTH) {
+      bpf_printk("skipping bucket %d: nstk=%llu > MAX=%d\n", i, mbp->header.nstk, MAX_STACK_DEPTH);
+      gobp = mbp->header.next;
+      continue;
+    }
+
+    // Only log buckets with actual allocations
+    if (mbp->header.size > 0) {
+      bpf_printk("bucket %d: size=%llu nstk=%llu\n", i, mbp->header.size, mbp->header.nstk);
+    }
+
+    // Move to the next bucket
+    gobp = mbp->header.next;
   }
 
   bpf_printk("found %d gobuckets\n", i);
@@ -156,13 +233,28 @@ record_profile_buckets(struct BadnessRecord *br, pid_t pid) {
 }
 
 SEC("kprobe/oom_kill_process")
-int BPF_KPROBE(oom_kill_process_handler) {
+int BPF_KPROBE(oom_kill_process_handler, struct oom_control *oc) {
   bpf_printk("oom_kill_process_handler\n");
   int key = 0;
   struct BadnessRecord *br = bpf_map_lookup_elem(&badness_record, &key);
   if (!br) {
     return 0;
   }
+
+  struct task_struct *victim = BPF_CORE_READ(oc, chosen);
+  if (!victim) {
+    bpf_printk("oom_kill_process_handler: victim is null\n");
+    return 0;
+  }
+  pid_t victim_pid = BPF_CORE_READ(victim, tgid);
+  pid_t victim_points = BPF_CORE_READ(oc, chosen_points);
+  if (br->canary_pid != victim_pid) {
+    bpf_printk("oom_kill_process_handler: failed to determine correct canary! %d\n", br->canary_pid);
+    return 0;
+  }
+
+  bpf_printk("oom_kill_process_handler: victim pid: %d, score: %d\n",
+    victim_pid, victim_points);
 
   bpf_printk("oom_kill_process_handler: canary pid: %d, score: %d\n",
              br->canary_pid, br->canary_score);
@@ -195,12 +287,26 @@ int BPF_KPROBE(oom_kill_process_handler) {
   }
   if (br->target_pid != 0) {
     bpf_printk("oom_kill_process_probe triggering target pid event: %d\n", br->target_pid);
+
+    // Set the target PID in the profile_pid map so signal_probe can read it
+    *target_pid = br->target_pid;
+
     struct Event ev = { .event_type = 0, .payload = br->target_pid};
     bpf_perf_event_output(ctx, &signal_events, BPF_F_CURRENT_CPU,
                           &ev, sizeof(struct Event));
   }
   return 0;
 }
+
+#define BADNESS_LOGGING 0
+
+#if BADNESS_LOGGING
+#define badness_log(fmt, args...) \
+  bpf_printk(fmt, ##args)
+#else
+#define badness_log(fmt, args...) \
+  do { } while (0)
+#endif
 
 SEC("kprobe/oom_badness")
 int BPF_KPROBE(oom_badness_entry, struct task_struct *p) {
@@ -227,20 +333,18 @@ int BPF_KRETPROBE(oom_badness_return, int score) {
   }
   pid_t pid = BPF_CORE_READ(task, tgid);
   if (br->canary_score < score) {
-    if (br->target_score < br->canary_score) {
-      bpf_printk("moved canary to target, score: %d, pid: %d\n", br->canary_score, br->canary_pid);
-      br->target_pid = br->canary_pid;
-      br->target_score = br->canary_score;
-      br->target_task = br->canary_task;
-    }
-    bpf_printk("canary score %d->%d\n", br->canary_score, score);
-    bpf_printk("  canary pid: %d->%d\n", br->canary_pid, pid);
+    badness_log("moving canary to target, score: %d, pid: %d\n", br->canary_score, br->canary_pid);
+    br->target_pid = br->canary_pid;
+    br->target_score = br->canary_score;
+    br->target_task = br->canary_task;
+    badness_log("canary score %d->%d\n", br->canary_score, score);
+    badness_log("  canary pid: %d->%d\n", br->canary_pid, pid);
     br->canary_pid = pid;
     br->canary_score = score;
     br->canary_task = (u64)task;
   } else if (br->target_score < score) {
-    bpf_printk("target score %d->%d\n", br->target_score, score);
-    bpf_printk("  target pid: %d->%d\n", br->target_pid, pid);
+    badness_log("target score %d->%d\n", br->target_score, score);
+    badness_log("  target pid: %d->%d\n", br->target_pid, pid);
     br->target_pid = pid;
     br->target_score = score;
     br->target_task = (u64)task;
@@ -256,21 +360,22 @@ int signal_probe(void *ctx) {
   pid_t pid = bpf_get_current_pid_tgid() >> 32;
   int key = 0;
   pid_t *target_pid = bpf_map_lookup_elem(&profile_pid, &key);
-  if (!target_pid || target_pid == 0) {
+  if (!target_pid || *target_pid == 0) {
     return 0;
   }
-  //bpf_printk("signal_probe: current pid: %d, target pid: %d\n", pid, *target_pid);
   if (*target_pid != pid) {
     return 0;
   }
   bpf_printk("target pid got signal: %d\n", pid);
+
   struct BadnessRecord *br = bpf_map_lookup_elem(&badness_record, &key);
   if (!br) {
     return 0;
   }
   record_profile_buckets(br, pid);
+
   // Signal userland
-  bpf_printk("sending profile recorded event: %d\n", target_pid);
+  bpf_printk("sending profile recorded event: %d\n", *target_pid);
   struct Event ev = { .event_type = 1, .payload = *target_pid};
   bpf_perf_event_output(ctx, &signal_events, BPF_F_CURRENT_CPU,
                         &ev, sizeof(struct Event));

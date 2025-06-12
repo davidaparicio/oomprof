@@ -14,9 +14,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestPass(t *testing.T) {
-}
-
 func TestOOM(t *testing.T) {
 	//t.Skip()
 
@@ -37,25 +34,9 @@ func TestOOM(t *testing.T) {
 	// Track if canary was killed
 	canaryKilled := make(chan struct{})
 
-	// Start OOM profiler
-	wg.Add(1)
-	oomProfDone := make(chan struct{})
-	oomProfReady := make(chan struct{})
-	go func() {
-		defer wg.Done()
-		defer close(oomProfDone)
-		// Signal that we're starting
-		close(oomProfReady)
-		err := SetupOomProf(ctx)
-		if err != nil && err != context.Canceled {
-			t.Log("SetupOomProf error:", err)
-		}
-	}()
-
-	// Wait for OOM profiler to start loading
-	<-oomProfReady
-	t.Log("Waiting for BPF objects to load...")
-	time.Sleep(2 * time.Second)
+	// Start OOM profiler (now runs in its own goroutines)
+	err = SetupOomProf(ctx)
+	require.NoError(t, err)
 
 	// Start target process which will consume all memory
 	wg.Add(1)
@@ -69,7 +50,9 @@ func TestOOM(t *testing.T) {
 				return
 			default:
 				cmd := exec.CommandContext(ctx, "./oomer.taux")
+				t.Log("starting oomer")
 				out, err := cmd.CombinedOutput()
+				t.Log("oomer exited: ", string(out), err)
 				if err != nil {
 					// Check if context was cancelled
 					if ctx.Err() != nil {
@@ -96,17 +79,21 @@ func TestOOM(t *testing.T) {
 		defer close(canaryDone)
 		err = can.Wait()
 		// err should be kill'd
-		t.Log("canary killed:", err)
+		t.Log("canary exited:", err)
 		close(canaryKilled)
 	}()
 
 	// Wait for canary to be killed or timeout
 	select {
+	case <-oomerDone:
+		t.Fatal("oomer died too soon")
 	case <-canaryKilled:
 		t.Log("Test completed: canary was killed")
 	case <-time.After(30 * time.Second):
 		t.Log("Test timeout: canary was not killed within 30 seconds")
 	}
+
+	t.Log("canceling")
 
 	// Cancel context to stop all goroutines
 	cancel()
@@ -125,11 +112,6 @@ func TestOOM(t *testing.T) {
 		// Check which goroutines are still running
 		var stillRunning []string
 		select {
-		case <-oomProfDone:
-		default:
-			stillRunning = append(stillRunning, "SetupOomProf")
-		}
-		select {
 		case <-oomerDone:
 		default:
 			stillRunning = append(stillRunning, "oomer launcher")
@@ -139,13 +121,13 @@ func TestOOM(t *testing.T) {
 		default:
 			stillRunning = append(stillRunning, "canary waiter")
 		}
-		
+
 		// Get goroutine dump
 		buf := make([]byte, 1<<16)
 		stackSize := runtime.Stack(buf, true)
 		stackDump := string(buf[:stackSize])
-		
-		panic(fmt.Sprintf("Timeout waiting for goroutines to exit. Still running: %v\n\nGoroutine dump:\n%s", 
+
+		panic(fmt.Sprintf("Timeout waiting for goroutines to exit. Still running: %v\n\nGoroutine dump:\n%s",
 			stillRunning, stackDump))
 	}
 }

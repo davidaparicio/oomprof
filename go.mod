@@ -4,6 +4,7 @@ go 1.24.0
 
 require (
 	github.com/cilium/ebpf v0.18.0
+	github.com/google/pprof v0.0.0-20250607225305-033d6d78b36a
 	github.com/stretchr/testify v1.10.0
 	go.opentelemetry.io/ebpf-profiler v0.0.0-20250519164423-009a07f3803c
 )
@@ -18,6 +19,6 @@ require (
 	github.com/rogpeppe/go-internal v1.13.1 // indirect
 	github.com/sirupsen/logrus v1.9.3 // indirect
 	github.com/zeebo/xxh3 v1.0.2 // indirect
-	golang.org/x/sys v0.31.0 // indirect
+	golang.org/x/sys v0.32.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

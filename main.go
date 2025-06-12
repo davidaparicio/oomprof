@@ -15,9 +15,10 @@ func main() {
 	// Enable memory profiling for this process
 	runtime.MemProfile(nil, false)
 	if len(os.Args) > 1 && os.Args[1] == "--canary" {
+		// Allocate some memory as ballast in a subprocess
 		fmt.Println("starting canary subprocess")
-		// Allocate 1% of system memory as ballast
-		oomprof.Canary(1.0)
+		// Things get flaky at 1%
+		oomprof.Canary(2.5)
 		// never returns...
 	}
 	oomprof.LaunchOOMCanary(os.Args[0])
