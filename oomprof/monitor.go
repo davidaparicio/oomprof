@@ -10,12 +10,11 @@ import (
 	"io"
 	"log"
 	"os"
-	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
-	"unsafe"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -27,18 +26,27 @@ import (
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target $GOARCH -tags linux bpf ../oomprof.c
 
+// ProfileData holds the profile information to be sent through the channel
+type ProfileData struct {
+	PID     uint32
+	Command string
+	Profile *profile.Profile
+}
+
 const (
 	lowMemEvent = iota
 	profileEvent
 )
 
-func SetupOomProf(ctx context.Context) error {
+func SetupOomProf(ctx context.Context, profileChan chan<- ProfileData) error {
 	// Check context before starting
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	default:
 	}
+
+	//TODO: check if kernel is older than 5.4 and exit if so
 
 	log.Println("Starting BPF object loading...")
 
@@ -48,13 +56,15 @@ func SetupOomProf(ctx context.Context) error {
 	}
 	// Load pre-compiled programs and maps into the kernel.
 	objs := bpfObjects{}
+
+	// Set program options - disable CO-RE for compatibility
+	var progOpts ebpf.ProgramOptions
+	progOpts.LogLevel = ebpf.LogLevelBranch | ebpf.LogLevelInstruction | ebpf.LogLevelStats
+	progOpts.LogSizeStart = 10 * 1024 * 1024 // Increased to 10MB
+
 	opts := ebpf.CollectionOptions{
-		Maps: ebpf.MapOptions{},
-		Programs: ebpf.ProgramOptions{
-			// Set the log level to 1 to get more information about the loading process.
-			LogLevel:     ebpf.LogLevelBranch | ebpf.LogLevelInstruction | ebpf.LogLevelStats,
-			LogSizeStart: 10 * 1024 * 1024, // Increased to 10MB
-		},
+		Maps:     ebpf.MapOptions{},
+		Programs: progOpts,
 	}
 
 	// Load BPF objects - this is the slow part that might get stuck
@@ -92,37 +102,15 @@ func SetupOomProf(ctx context.Context) error {
 		return fmt.Errorf("initializing profile_pid map: %w", err)
 	}
 
-	kp1, err := link.Kprobe("oom_badness", objs.OomBadnessEntry, nil)
+	oomMarkVictimTracepoint, err := link.Tracepoint("oom", "mark_victim", objs.OomMarkVictimHandler, nil)
 	if err != nil {
 		objs.Close()
 		return err
 	}
 
-	kp2, err := link.Kretprobe("oom_badness", objs.OomBadnessReturn, nil)
-	if err != nil {
-		kp1.Close()
-		objs.Close()
-		return err
-	}
-
-	kp3, err := link.Kprobe("oom_kill_process", objs.OomKillProcessHandler, nil)
-	if err != nil {
-		kp2.Close()
-		kp1.Close()
-		objs.Close()
-		return err
-	}
-
-	// sigKprobe, err := link.Kretprobe("complete_signal", objs.SignalProbe, nil)
-	// if err != nil {
-	// 	log.Fatalf("linking kprobe: %v", err)
-	// }
-	// defer sigKprobe.Close()
 	schedSwitch, err := link.Tracepoint("signal", "signal_deliver", objs.SignalProbe, nil)
 	if err != nil {
-		kp3.Close()
-		kp2.Close()
-		kp1.Close()
+		oomMarkVictimTracepoint.Close()
 		objs.Close()
 		var verr *ebpf.VerifierError
 		if errors.As(err, &verr) {
@@ -140,9 +128,15 @@ func SetupOomProf(ctx context.Context) error {
 	// Fixme: remove entries when process goes away
 	seenMap := make(map[uint32]int64)
 
-	go monitorEventMap(ctx, &objs.bpfMaps)
+	// Create a sync.Map to store pid -> exe path mapping
+	pidToExePath := &sync.Map{}
+
+	go monitorEventMap(ctx, &objs.bpfMaps, pidToExePath, profileChan)
 
 	log.Println("Starting main monitoring loop...")
+
+	// Channel to signal when first scan is complete
+	firstScanDone := make(chan struct{})
 
 	// Run the monitoring loop in a goroutine
 	go func() {
@@ -150,21 +144,24 @@ func SetupOomProf(ctx context.Context) error {
 		defer func() {
 			log.Println("Cleaning up BPF resources")
 			schedSwitch.Close()
-			kp3.Close()
-			kp2.Close()
-			kp1.Close()
+			oomMarkVictimTracepoint.Close()
 			objs.Close()
 		}()
 
+		firstScan := true
 		for {
 			select {
 			case <-ctx.Done():
 				log.Println("Context cancelled, shutting down monitoring loop")
 				return
 			default:
-				newProcs, err := scanGoProcesses(ctx, seenMap)
+				newProcs, err := scanGoProcesses(ctx, seenMap, pidToExePath)
 				if err != nil {
 					log.Printf("error scanning Go processes: %v", err)
+					if firstScan {
+						close(firstScanDone)
+						firstScan = false
+					}
 					continue
 				}
 				// Display the results
@@ -178,20 +175,35 @@ func SetupOomProf(ctx context.Context) error {
 						continue
 					}
 				}
+
+				// Signal that first scan is complete
+				if firstScan {
+					close(firstScanDone)
+					firstScan = false
+				}
+
 				// sleep for a second with context check
 				select {
 				case <-ctx.Done():
 					return
-				case <-time.After(1 * time.Second):
+				case <-time.After(10 * time.Millisecond):
 				}
 			}
 		}
 	}()
 
+	// Wait for first scan to complete before returning
+	select {
+	case <-firstScanDone:
+		log.Println("First Go process scan completed")
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
 	return nil
 }
 
-func readProfile(maps *bpfMaps, numBuckets uint32) error {
+func readProfile(maps *bpfMaps, numBuckets uint32, binaryPath string) (*profile.Profile, error) {
 	const maxBatchSize = uint32(32) // Adjust based on your needs and kernel limits
 
 	var allBuckets []bpfGobucket
@@ -216,7 +228,7 @@ func readProfile(maps *bpfMaps, numBuckets uint32) error {
 		// Batch lookup
 		count, err := maps.MemBuckets.BatchLookup(&cursor, keys, values, nil)
 		if err != nil {
-			return fmt.Errorf("batch lookup failed at offset %d: %v", start, err)
+			return nil, fmt.Errorf("batch lookup failed at offset %d: %v", start, err)
 		}
 
 		// Add retrieved buckets to our collection
@@ -231,174 +243,23 @@ func readProfile(maps *bpfMaps, numBuckets uint32) error {
 	// Process the retrieved buckets
 	log.Printf("Retrieved %d buckets out of %d", len(allBuckets), numBuckets)
 
+	// Clear the profile_pid map for the next profile
+	var key uint32 = 0
+	var pidValue int32 = 0
+	if err := maps.ProfilePid.Put(key, pidValue); err != nil {
+		return nil, fmt.Errorf("clearing profile_pid map: %w", err)
+	}
+
 	// Convert to pprof format
-	// TODO: We should get the actual binary path from the process info
-	// For now, assume it's oomer.taux since that's the target process
-	binaryPath := "./oomer.taux"
 	prof, err := bucketsToPprof(allBuckets, binaryPath)
 	if err != nil {
-		return fmt.Errorf("failed to convert buckets to pprof: %v", err)
-	}
-
-	// Write pprof file
-	filename := fmt.Sprintf("oomprof_%d.pb.gz", time.Now().Unix())
-	f, err := os.Create(filename)
-	if err != nil {
-		return fmt.Errorf("failed to create pprof file: %v", err)
-	}
-	defer f.Close()
-
-	if err := prof.Write(f); err != nil {
-		return fmt.Errorf("failed to write pprof file: %v", err)
-	}
-
-	log.Printf("Profile written to %s", filename)
-	return nil
-}
-
-// resolveSymbol uses addr2line to resolve an address to function name and location
-func resolveSymbol(binaryPath string, addr uint64) (string, string, int64) {
-	if binaryPath == "" {
-		return fmt.Sprintf("func_%x", addr), "", 0
-	}
-
-	cmd := exec.Command("addr2line", "-e", binaryPath, "-f", "-C", fmt.Sprintf("0x%x", addr))
-	output, err := cmd.Output()
-	if err != nil {
-		return fmt.Sprintf("func_%x", addr), "", 0
-	}
-
-	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
-	if len(lines) >= 2 {
-		funcName := strings.TrimSpace(lines[0])
-		location := strings.TrimSpace(lines[1])
-
-		// Extract line number if available
-		var lineNum int64 = 1
-		if parts := strings.Split(location, ":"); len(parts) >= 2 {
-			if num, err := strconv.ParseInt(parts[1], 10, 64); err == nil {
-				lineNum = num
-			}
-		}
-
-		if funcName != "??" && location != "??:0" {
-			return funcName, location, lineNum
-		}
-	}
-
-	return fmt.Sprintf("func_%x", addr), "", 0
-}
-
-func (b *bpfGobucket) memRecord() *bpfMemRecord {
-	//get a pointer to end of the stk elements
-	return (*bpfMemRecord)(unsafe.Pointer(uintptr(unsafe.Pointer(&b.Stk[0])) + uintptr(b.Header.Nstk*8)))
-}
-
-func bucketsToPprof(buckets []bpfGobucket, binaryPath string) (*profile.Profile, error) {
-	// Create a new pprof profile
-	prof := &profile.Profile{
-		SampleType: []*profile.ValueType{
-			{Type: "alloc_objects", Unit: "count"},
-			{Type: "alloc_space", Unit: "bytes"},
-		},
-		PeriodType: &profile.ValueType{Type: "space", Unit: "bytes"},
-		Period:     1,
-		TimeNanos:  time.Now().UnixNano(),
-	}
-
-	// Track unique locations and functions
-	locationMap := make(map[uint64]*profile.Location)
-	functionMap := make(map[uint64]*profile.Function)
-	nextLocationID := uint64(1)
-	nextFunctionID := uint64(1)
-
-	// Process each bucket
-	for _, bucket := range buckets {
-		mr := bucket.memRecord()
-		allocs, allocBytes := mr.Active.Allocs, mr.Active.AllocBytes
-		for i := 0; i < 3; i++ {
-			allocs += mr.Future[i].Allocs
-			allocBytes += mr.Future[i].AllocBytes
-		}
-		if allocs == 0 {
-			continue
-		}
-
-		// Create locations for the stack trace
-		var locations []*profile.Location
-
-		// Process stack frames (up to nstk)
-		stackLen := int(bucket.Header.Nstk)
-
-		for i := 0; i < stackLen; i++ {
-			addr := bucket.Stk[i]
-			if addr == 0 {
-				break
-			}
-
-			// Check if we already have this location
-			loc, exists := locationMap[addr]
-			if !exists {
-				// Create a new location
-				loc = &profile.Location{
-					ID:      nextLocationID,
-					Address: addr,
-				}
-				nextLocationID++
-
-				// Create a function for this location using symbol resolution
-				fn, fnExists := functionMap[addr]
-				if !fnExists {
-					funcName, location, lineNum := resolveSymbol(binaryPath, addr)
-					fn = &profile.Function{
-						ID:         nextFunctionID,
-						Name:       funcName,
-						SystemName: funcName,
-						Filename:   location,
-						StartLine:  lineNum,
-					}
-					nextFunctionID++
-					functionMap[addr] = fn
-					prof.Function = append(prof.Function, fn)
-				}
-
-				// Add function to location
-				loc.Line = []profile.Line{
-					{
-						Function: fn,
-						Line:     1,
-					},
-				}
-
-				locationMap[addr] = loc
-				prof.Location = append(prof.Location, loc)
-			}
-
-			locations = append(locations, loc)
-		}
-
-		// Create a sample
-		log.Println("Adding sample with allocs:", allocs, "bytes:", allocBytes, "locations:", len(locations))
-		sample := &profile.Sample{
-			Location: locations,
-			Value:    []int64{int64(allocs), int64(allocBytes)}, // count, bytes
-		}
-		prof.Sample = append(prof.Sample, sample)
-	}
-
-	// Sort locations by ID
-	for i := range prof.Location {
-		for j := i + 1; j < len(prof.Location); j++ {
-			if prof.Location[i].ID > prof.Location[j].ID {
-				prof.Location[i], prof.Location[j] = prof.Location[j], prof.Location[i]
-			}
-		}
+		return nil, fmt.Errorf("failed to convert buckets to pprof: %v", err)
 	}
 
 	return prof, nil
 }
 
-func monitorEventMap(ctx context.Context, maps *bpfMaps) {
+func monitorEventMap(ctx context.Context, maps *bpfMaps, pidToExePath *sync.Map, profileChan chan<- ProfileData) {
 	eventReader, err := perf.NewReader(maps.SignalEvents, 1)
 	if err != nil {
 		log.Printf("error creating perf reader: %v", err)
@@ -448,10 +309,40 @@ func monitorEventMap(ctx context.Context, maps *bpfMaps) {
 					continue
 				}
 				log.Printf("Found Go process with PID %d with %d buckets", pid, gop.NumBuckets)
-				if err := readProfile(maps, gop.NumBuckets); err != nil {
+
+				// Retrieve the binary path from the sync.Map
+				binaryPath := ""
+				if pathValue, ok := pidToExePath.Load(pid); ok {
+					binaryPath = pathValue.(string)
+				} else {
+					log.Printf("Warning: binary path not found for PID %d", pid)
+				}
+
+				prof, err := readProfile(maps, gop.NumBuckets, binaryPath)
+				if err != nil {
 					log.Printf("error reading profile for PID %d: %v", pid, err)
 				} else {
 					log.Printf("Successfully read profile for PID %d", pid)
+					// Extract command name from exe path
+					command := "unknown"
+					if binaryPath != "" {
+						// Get just the basename of the binary path
+						if idx := strings.LastIndex(binaryPath, "/"); idx != -1 {
+							command = binaryPath[idx+1:]
+						} else {
+							command = binaryPath
+						}
+					}
+					// Send profile data through channel
+					select {
+					case profileChan <- ProfileData{
+						PID:     pid,
+						Command: command,
+						Profile: prof,
+					}:
+					case <-ctx.Done():
+						return
+					}
 				}
 			case lowMemEvent:
 				pid = ev.Payload
@@ -470,7 +361,7 @@ func monitorEventMap(ctx context.Context, maps *bpfMaps) {
 
 // scanGoProcesses scans the /proc filesystem for running Go processes
 // and returns a slice of GoProcessInfo structs with PID and mbuckets address
-func scanGoProcesses(ctx context.Context, goProcs map[uint32]int64) ([]GoProcessInfo, error) {
+func scanGoProcesses(ctx context.Context, goProcs map[uint32]int64, pidToExePath *sync.Map) ([]GoProcessInfo, error) {
 	var results []GoProcessInfo
 
 	// Open /proc directory
@@ -513,12 +404,30 @@ func scanGoProcesses(ctx context.Context, goProcs map[uint32]int64) ([]GoProcess
 		// Get the executable path for this PID
 		exePath := fmt.Sprintf("/proc/%d/exe", pid)
 
+		// Resolve the actual executable path by following the symlink
+		realExePath, err := os.Readlink(exePath)
+		if err != nil {
+			// Skip if we can't read the exe link (usually permission issues)
+			goProcs[uint32(pid)] = -1
+			log.Printf("error reading exe link for PID %d: %v", pid, err)
+			continue
+		}
+
 		// Try to read the command line to get more info
 		cmdlinePath := fmt.Sprintf("/proc/%d/cmdline", pid)
 		cmdline, err := os.ReadFile(cmdlinePath)
 		if err != nil {
 			// Skip if we can't read the command line (usually permission issues)
 			goProcs[uint32(pid)] = -1
+			log.Printf("error reading cmdline for PID %d: %v", pid, err)
+			continue
+		}
+		commPath := fmt.Sprintf("/proc/%d/comm", pid)
+		comm, err := os.ReadFile(commPath)
+		if err != nil {
+			// Skip if we can't read the command line (usually permission issues)
+			goProcs[uint32(pid)] = -1
+			log.Printf("error reading comm for PID %d: %v", pid, err)
 			continue
 		}
 
@@ -529,6 +438,7 @@ func scanGoProcesses(ctx context.Context, goProcs map[uint32]int64) ([]GoProcess
 		if err != nil {
 			// Skip if we can't open the executable (usually permission issues)
 			goProcs[uint32(pid)] = -1
+			log.Printf("error opening ELF file for PID %d: %v", pid, err)
 			continue
 		}
 
@@ -537,6 +447,7 @@ func scanGoProcesses(ctx context.Context, goProcs map[uint32]int64) ([]GoProcess
 		if err != nil || goVersion == "" {
 			elfFile.Close()
 			goProcs[uint32(pid)] = -1
+			//log.Printf("error getting Go version for PID %d: %v", pid, err)
 			continue
 		}
 
@@ -556,14 +467,18 @@ func scanGoProcesses(ctx context.Context, goProcs map[uint32]int64) ([]GoProcess
 		}
 
 		goProcs[uint32(pid)] = int64(mbucketsAddr.Address)
-		log.Printf("Found Go program with PID %d mbuckets: %x %s\n", pid, mbucketsAddr.Address, cmdlineStr)
+		log.Printf("Found Go program with PID %d mbuckets: %x comm:%s cmdline: %s\n", pid, mbucketsAddr.Address, strings.TrimSpace(string(comm)), cmdlineStr)
+
+		// Store the PID to exe path mapping in the sync.Map
+		pidToExePath.Store(uint32(pid), realExePath)
+
 		// Create a GoProcessInfo struct and add it to our results
 		procInfo := GoProcessInfo{
 			PID:          uint32(pid),
 			GoVersion:    goVersion,
 			MBucketsAddr: uint64(mbucketsAddr.Address),
 			CmdLine:      cmdlineStr,
-			ExePath:      exePath,
+			ExePath:      realExePath,
 		}
 
 		results = append(results, procInfo)

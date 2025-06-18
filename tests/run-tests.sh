@@ -23,8 +23,9 @@ if [[ -z "${kernel_version}" ]]; then
   exit 1
 fi
 
-readonly output="$(mktemp -d --suffix=-output)"
-readonly kern_dir="${KERN_DIR:-ci-kernels}"
+readonly output="test-${kernel_version}/"
+mkdir -p "${output}"
+readonly kern_dir="${KERN_DIR:-../ci-kernels}"
 
 test -e "${kern_dir}/${kernel_version}/vmlinuz" || {
   echo "Failed to find kernel image ${kern_dir}/${kernel_version}/vmlinuz."
@@ -33,15 +34,19 @@ test -e "${kern_dir}/${kernel_version}/vmlinuz" || {
 
 echo Generating initramfs
 expected=0
+
 bb_args=(-o "${output}/initramfs.cpio")
 while IFS='' read -r -d '' line ; do
     bb_args+=(-e "${line}:-test.v")
     ((expected=expected+1))
 done < <(find . -name '*.test' -print0)
 
+# Add all taux files and run-in-cgroup.sh with flat structure
 while IFS='' read -r -d '' line ; do
   bb_args+=(-r "${line}")
 done < <(find . -name '*.taux' -print0)
+
+bb_args+=(-r "run-in-cgroup.sh")
 
 additionalQemuArgs=""
 
@@ -65,15 +70,17 @@ if [ "$qemu_arch" = "aarch64" ]; then
     additionalQemuArgs+=" -machine virt -cpu max"
 fi
 
+echo bb_args: "${bb_args[@]}"
 bluebox "${bb_args[@]}" || (echo "failed to generate initramfs"; exit 1)
 
 echo Testing on "${kernel_version}"
+
 $sudo qemu-system-${qemu_arch} ${additionalQemuArgs} \
 	-nographic \
 	-monitor none \
 	-serial file:"${output}/test.log" \
 	-no-user-config \
-	-m 1G \
+	-m 950M \
 	-kernel "${kern_dir}/${kernel_version}/vmlinuz" \
 	-initrd "${output}/initramfs.cpio"
 
@@ -94,6 +101,7 @@ else
   EXIT_CODE=0
 fi
 
-$sudo rm -rf "${output}"
+# Keep output directory for inspection
+echo "Test output saved in ${output}"
 
 exit $EXIT_CODE
