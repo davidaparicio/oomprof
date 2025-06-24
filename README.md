@@ -1,22 +1,23 @@
 # OOMProf - eBPF-based OOM Kill Profiler
 
-OOMProf is an eBPF-based process monitor that automatically captures heap profiles from Go programs just before they are killed by the Linux Out-of-Memory (OOM) killer. This enables post-mortem analysis of memory usage patterns that led to OOM conditions.
+OOMProf is an eBPF-based process monitor that automatically captures heap profiles from Go programs just before they are killed by the Linux Out-of-Memory (OOM) killer, or on-demand for specific processes. This enables post-mortem analysis of memory usage patterns that led to OOM conditions.
 
 ## Features
 
 - **Real-time Go process detection**: Automatically discovers and monitors running Go programs
 - **Pre-OOM profiling**: Captures memory profiles at the moment of OOM kill signals
-- **eBPF-powered monitoring**: Uses kernel probes for low-overhead process monitoring
+- **On-demand profiling**: Profile specific processes by PID using the `-p` flag
+- **eBPF-powered monitoring**: Uses kernel tracepoints for low-overhead process monitoring
 - **Standard pprof output**: Generates profiles compatible with Go's pprof toolchain
 - **Memory limit testing**: Includes cgroup-based testing framework for reproducible OOM scenarios
 
 ## How It Works
 
-OOMProf uses eBPF probes to monitor kernel OOM killer events and automatically:
+OOMProf uses eBPF tracepoints to monitor kernel OOM killer events and automatically:
 
 1. **Scans** the system for running Go processes and tracks their memory bucket addresses
-2. **Detects** when the OOM killer is about to terminate a Go process
-3. **Captures** the process's heap profile data from kernel space
+2. **Detects** when the OOM killer is about to terminate a Go process via `oom/mark_victim` tracepoint
+3. **Captures** the process's heap profile data from kernel space using `signal/signal_deliver` tracepoint
 4. **Generates** a standard pprof-compatible profile file
 
 The captured profiles show memory allocation patterns, call stacks, and heap usage that can help identify memory leaks, excessive allocations, or other issues that led to the OOM condition.
@@ -39,7 +40,7 @@ make
 ```
 
 This creates:
-- `oompa` - Main OOMProf monitor
+- `oompa` - Main OOMProf monitor (OOM Profiler Agent)
 - `tests/oomer.taux` - Test binary for generating OOM conditions  
 - `tests/gccache.taux` - Test binary for GC cache stress testing
 - `oomprof.test` - Test suite
@@ -55,6 +56,20 @@ sudo ./oompa
 ```
 
 When a Go process is OOM killed, OOMProf will automatically generate a profile file named `{command}-{pid}.pb.gz`.
+
+### On-Demand Profiling
+
+Profile specific processes by PID using the `-p` flag with comma-delimited PIDs:
+
+```bash
+# Profile a single process
+sudo ./oompa -p 1234
+
+# Profile multiple processes
+sudo ./oompa -p 1234,5678,9012
+```
+
+This will generate profile files for each specified PID and exit once profiling is complete.
 
 ### Analyzing Profiles
 
@@ -94,12 +109,12 @@ sudo go test -v ./oomprof -run TestOOMProfLowMemoryLimits
 
 ```
 ┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
-│   Go Process    │    │   eBPF Probes    │    │   OOMProf       │
+│   Go Process    │    │ eBPF Tracepoints │    │   OOMProf       │
 │                 │    │                  │    │                 │
 │ ┌─────────────┐ │    │ ┌──────────────┐ │    │ ┌─────────────┐ │
-│ │ Memory      │ │    │ │ oom_badness  │ │    │ │ Process     │ │
-│ │ Allocations │ │────┼▶│ oom_kill_    │ │────┼▶│ Scanner     │ │
-│ │             │ │    │ │ process      │ │    │ │             │ │
+│ │ Memory      │ │    │ │ oom/mark_    │ │    │ │ Process     │ │
+│ │ Allocations │ │────┼▶│ victim       │ │────┼▶│ Scanner     │ │
+│ │             │ │    │ │ signal/      │ │    │ │             │ │
 │ └─────────────┘ │    │ │ signal_      │ │    │ └─────────────┘ │
 │                 │    │ │ deliver      │ │    │                 │
 │ ┌─────────────┐ │    │ └──────────────┘ │    │ ┌─────────────┐ │
@@ -156,7 +171,6 @@ oomprof/
 - [ ] Integration with standard observability reporters
 - [ ] Rust jemalloc support
 - [ ] Python memory profiling
-- [ ] Native oomkill tracepoint support (replacing kprobes)
 
 ## Contributing
 
