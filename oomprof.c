@@ -2,6 +2,19 @@
 //go:build ignore
 // clang-format on
 
+// Copyright 2022-2025 The Parca Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // Produced by:
 // bpftool btf dump file /sys/kernel/btf/vmlinux format c > include/vmlinux.h
 #include "include/vmlinux.h"
@@ -22,9 +35,23 @@
 	bpf_trace_printk(____fmt, sizeof(____fmt), ##args); \
 })
 
+// Conditional debug logging macro - for now just use bpf_printk directly
+// TODO: Make this runtime configurable without verifier issues
+#define DEBUG_PRINT(fmt, args...) bpf_printk(fmt, ##args)
+
 #define MAX_STACK_DEPTH 128
+#define MAX_BUCKETS_PER_LOOP 2729
+// Maximum number of tail calls allowed. With MAX_BUCKETS_PER_LOOP=2729, this allows
+// processing up to (10+1) * 2729 = 30,019 buckets, which fits within the 30,000
+// mem_buckets map limit. If this value is increased, mem_buckets max_entries must
+// also be increased proportionally: new_limit >= (MAX_TAIL_CALLS+1) * MAX_BUCKETS_PER_LOOP
+#define MAX_TAIL_CALLS 10
 
 char __license[] SEC("license") = "Dual MIT/GPL";
+
+typedef enum Programs {
+    RECORD_PROFILE_BUCKETS_PROG=0
+} Programs;
 
 // https://github.com/golang/go/blob/6885bad7dd/src/runtime/mprof.go#L148
 struct memRecordCycle {
@@ -62,7 +89,9 @@ struct gobucket {
 
 struct GoProc {
   u64 mbuckets; // static doesn't change
-  u32 num_buckets;  // updated after each profile is recorded
+  u32 num_buckets;  // updated after each profile is record
+  u32 maxStackErrors;
+  bool readError;
 };
 
 struct Event {
@@ -74,15 +103,14 @@ struct ProfileState {
     u32 pid;
     u64 gobp;
     u32 bucket_count;
-    u32 current_bucket;
-    u32 max_buckets;
+    u32 num_tail_calls;  // used to limit tail calls
 };
 
 
-// Tail call map for bucket processing
+// Tail call map for bucket processing - support up to 10 tail calls
 struct {
   __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-  __uint(max_entries, 2);
+  __uint(max_entries, 1);
   __type(key, u32);
   __type(value, u32);
 } tail_call_map SEC(".maps");
@@ -95,12 +123,13 @@ struct {
   __uint(max_entries, 1);
 } profile_state SEC(".maps");
 
+
+// Default to handle large real programs with many allocation sites
 struct {
   __uint(type, BPF_MAP_TYPE_ARRAY);
   __type(key, u32);
   __type(value, struct gobucket);
-  // This is probably way too big, but we can always reduce it later.
-  __uint(max_entries, 179999);
+  __uint(max_entries, 30000);
 } mem_buckets SEC(".maps");
 
 // Map of go procs to mbuckets address
@@ -118,6 +147,7 @@ struct {
   __type(value, pid_t);
   __uint(max_entries, 1);
 } profile_pid SEC(".maps");
+
 
 struct {
   __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
@@ -144,37 +174,31 @@ struct {
 } dummy_record_map SEC(".maps");
 
 static inline __attribute__((__always_inline__)) int
-record_profile_buckets(pid_t pid) {
+record_profile_buckets(void *ctx, struct ProfileState *state) {
+  DEBUG_PRINT("recording profile buckets for pid: %d mbuckets:%llx\n", state->pid, state->gobp);
+  struct gobucket *mbp = 0;
+  pid_t pid = state->pid;
   struct GoProc* gop = bpf_map_lookup_elem(&go_procs, &pid);
   if (!gop) {
-    bpf_printk("go_procs lookup failed: %d\n", pid);
-    return 0;
-  }
-  if (gop->mbuckets == 0) {
-    bpf_printk("mbuckets is NULL, no MemProfileRate ref in program or possibly stripped\n");
+    DEBUG_PRINT("signal_probe: go_procs lookup failed: %d\n", pid);
     return 0;
   }
 
-  u64 gobp;
-  if (bpf_probe_read_user(&gobp, sizeof(void*), (void*)gop->mbuckets)) {
-    bpf_printk("failed to read mbuckets pointer for pid: %d\n", pid);
-    return 0;
-  }
-
-  bpf_printk("recording profile buckets for pid: %d mbuckets:%llx\n", pid, gobp);
-  struct gobucket *mbp = 0;
-  u32 i = 0;
-  for (; gobp != 0; i++, gobp = mbp->header.allnext) {
-    // Loop limit to avoid verifier issues
-    if (i >= 3000) {
-      bpf_printk("hit bucket limit\n");
-      break;
+  for (u32 i=0; state->gobp != 0; i++, state->gobp = mbp->header.allnext) {
+    if (i >= MAX_BUCKETS_PER_LOOP) {
+      state->num_tail_calls++;
+      if (state->num_tail_calls > MAX_TAIL_CALLS) {
+        DEBUG_PRINT("record_profile_buckets: too many tail calls, aborting\n");
+        return 0;
+      }
+      bpf_tail_call(ctx, &tail_call_map, RECORD_PROFILE_BUCKETS_PROG);
+      return 0;
     }
 
     int key = i;
     mbp = bpf_map_lookup_elem(&mem_buckets, &key);
     if (!mbp) {
-      bpf_printk("mem_buckets lookup failed %d:%llx\n", i, gobp);
+      DEBUG_PRINT("mem_buckets lookup failed %d:%llx\n", i, state->gobp);
       return 0;
     }
     // Read the entire bucket structure in one go
@@ -183,23 +207,42 @@ record_profile_buckets(pid_t pid) {
                      (MAX_STACK_DEPTH * sizeof(u64)) +
                      sizeof(struct memRecord);
 
-    if (bpf_probe_read_user(mbp, total_size, (void*)gobp)) {
+    if (bpf_probe_read_user(mbp, total_size, (void*)state->gobp)) {
       // TODO: investigate why this can fail
-      bpf_printk("failed to read full bucket at %llx\n", gobp);
+      DEBUG_PRINT("failed to read full bucket at %llx\n", state->gobp);
+      gop->readError = true;
       break;
     }
 
     // Skip buckets with stack depth > MAX_STACK_DEPTH
     if (mbp->header.nstk > MAX_STACK_DEPTH) {
-      bpf_printk("skipping bucket %d: nstk=%llu > MAX=%d\n", i, mbp->header.nstk, MAX_STACK_DEPTH);
+      DEBUG_PRINT("skipping bucket %d: nstk=%llu > MAX=%d\n", i, mbp->header.nstk, MAX_STACK_DEPTH);
+      gop->maxStackErrors++;
       continue;
     }
+    state->bucket_count++;
   }
 
-  bpf_printk("found %d gobuckets\n", i);
-  gop->num_buckets = i;
+  DEBUG_PRINT("found %d gobuckets\n", state->bucket_count);
+  gop->num_buckets = state->bucket_count;
+
+  // Signal userland
+  DEBUG_PRINT("sending profile recorded event: %d\n", state->pid);
+  struct Event ev = { .event_type = 1, .payload = state->pid};
+  bpf_perf_event_output(ctx, &signal_events, BPF_F_CURRENT_CPU,
+                        &ev, sizeof(struct Event));
 
   return 0;
+}
+
+SEC("tracepoint")
+int record_profile_buckets_prog(void *ctx) {
+  int key=0;
+  struct ProfileState *state = bpf_map_lookup_elem(&profile_state, &key);
+  if (!state) {
+    return 0;
+  }
+  return record_profile_buckets(ctx, state);
 }
 
 // don't rely on BTF
@@ -211,17 +254,17 @@ struct _trace_event_raw_mark_victim {
 SEC("tracepoint/oom/mark_victim")
 int oom_mark_victim_handler(struct _trace_event_raw_mark_victim *args) {
   pid_t victim_pid = args->pid;
-  bpf_printk("oom_mark_victim_handler: victim pid: %d\n", victim_pid);
+  DEBUG_PRINT("oom_mark_victim_handler: victim pid: %d\n", victim_pid);
 
   int key=0;
   pid_t *target_pid = bpf_map_lookup_elem(&profile_pid, &key);
   if (!target_pid) {
-    bpf_printk("profile_pid lookup failed\n");
+    DEBUG_PRINT("profile_pid lookup failed\n");
     return 0;
   }
 
   if (*target_pid != 0) {
-    bpf_printk("profile_pid already set to %d, ignoring new victim pid %d\n",
+    DEBUG_PRINT("profile_pid already set to %d, ignoring new victim pid %d\n",
                *target_pid, victim_pid);
     return 0;
   }
@@ -232,47 +275,53 @@ int oom_mark_victim_handler(struct _trace_event_raw_mark_victim *args) {
 
   struct GoProc* gop = bpf_map_lookup_elem(&go_procs, &victim_pid);
   if (!gop) {
-    bpf_printk("oommark_victim: go_procs lookup failed, timing issue? %d\n", victim_pid);
+    DEBUG_PRINT("oommark_victim: go_procs lookup failed, timing issue? %d\n", victim_pid);
     return 0;
   }
 
-
   return 0;
 }
-
 
 SEC("tracepoint/signal/signal_deliver")
 int signal_probe(struct trace_event_raw_signal_deliver *ctx) {
   pid_t pid = bpf_get_current_pid_tgid() >> 32;
   struct GoProc* gop = bpf_map_lookup_elem(&go_procs, &pid);
   if (!gop) {
-    //bpf_printk("signal_probe: go_procs lookup failed: %d\n", pid);
+    DEBUG_PRINT("signal_probe: go_procs lookup failed: %d\n", pid);
     return 0;
   }
 
   int key=0;
   pid_t *target_pid = bpf_map_lookup_elem(&profile_pid, &key);
   if (!target_pid) {
-    bpf_printk("profile_pid lookup failed\n");
+    DEBUG_PRINT("profile_pid lookup failed\n");
     return 0;
   }
   if (*target_pid != pid) {
-//    bpf_printk("signal_probe: target pid not current pid, ignoring signal\n");
+    DEBUG_PRINT("signal_probe: target pid not current pid, ignoring signal\n");
     return 0;
   }
-  // Usually we get a couple cracks at this and if first one fails num_buckets is 0
+  // num_buckets reset after reading, ignore if not zero.
   if (gop->num_buckets > 0) {
-    bpf_printk("signal_probe: already recorded profile for pid %d, ignoring signal\n", pid);
+    DEBUG_PRINT("signal_probe: already recorded profile for pid %d, ignoring signal\n", pid);
     return 0;
   }
-  bpf_printk("go proc %d got signal\n", pid);
-  record_profile_buckets(pid);
+  DEBUG_PRINT("go proc %d got signal\n", pid);
 
-  // Signal userland
-  bpf_printk("sending profile recorded event: %d\n", *target_pid);
-  struct Event ev = { .event_type = 1, .payload = *target_pid};
-  bpf_perf_event_output(ctx, &signal_events, BPF_F_CURRENT_CPU,
-                        &ev, sizeof(struct Event));
+  struct ProfileState *state = bpf_map_lookup_elem(&profile_state, &key);
+  if (!state) {
+    return 0;
+  }
+  state->pid = pid;
+  state->bucket_count = 0;
+  state->num_tail_calls = 0;
+  u64 gobp;
+  if (bpf_probe_read_user(&gobp, sizeof(void*), (void*)gop->mbuckets)) {
+    DEBUG_PRINT("failed to read mbuckets pointer for pid: %d\n", pid);
+    return 0;
+  }
+  state->gobp = gobp;
+  record_profile_buckets(ctx, state);
 
   return 0;
 }

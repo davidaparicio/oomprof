@@ -1,2 +1,6 @@
 ci-kernels*
 oomprof/bpf*
+tests/*.taux
+*.pb.gz
+oompa
+tests/oomprof.test
