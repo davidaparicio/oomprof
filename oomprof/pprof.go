@@ -33,13 +33,15 @@ func (b *bpfGobucket) memRecord() *bpfMemRecord {
 func bucketsToPprof(buckets []bpfGobucket, binaryPath string) (*profile.Profile, error) {
 	// Create a new pprof profile
 	prof := &profile.Profile{
+		DefaultSampleType: "inuse_space",
 		SampleType: []*profile.ValueType{
 			{Type: "alloc_objects", Unit: "count"},
 			{Type: "alloc_space", Unit: "bytes"},
+			{Type: "inuse_objects", Unit: "count"},
+			{Type: "inuse_space", Unit: "bytes"},
 		},
 		PeriodType: &profile.ValueType{Type: "space", Unit: "bytes"},
-		Period:     1,
-		TimeNanos:  time.Now().UnixNano(),
+		Period:     512 * 1024, // TODO: read this from process
 	}
 
 	// Track unique locations and functions
@@ -59,7 +61,7 @@ func bucketsToPprof(buckets []bpfGobucket, binaryPath string) (*profile.Profile,
 		if allocs == 0 {
 			continue
 		}
-		
+
 		stackLen := int(bucket.Header.Nstk)
 		for i := 0; i < stackLen; i++ {
 			addr := bucket.Stk[i]
@@ -78,10 +80,13 @@ func bucketsToPprof(buckets []bpfGobucket, binaryPath string) (*profile.Profile,
 	// Process each bucket
 	for b, _ := range buckets {
 		mr := buckets[b].memRecord()
-		allocs, allocBytes := mr.Active.Allocs-mr.Active.Frees, mr.Active.AllocBytes-mr.Active.FreeBytes
+		allocs, allocBytes := mr.Active.Allocs, mr.Active.AllocBytes
+		inuse, inuseBytes := mr.Active.Allocs-mr.Active.Frees, mr.Active.AllocBytes-mr.Active.FreeBytes
 		for i := 0; i < 3; i++ {
-			allocs += mr.Future[i].Allocs - mr.Future[i].Frees
-			allocBytes += mr.Future[i].AllocBytes - mr.Future[i].FreeBytes
+			allocs += mr.Future[i].Allocs
+			allocBytes += mr.Future[i].AllocBytes
+			inuse += mr.Future[i].Allocs - mr.Future[i].Frees
+			inuseBytes += mr.Future[i].AllocBytes - mr.Future[i].FreeBytes
 		}
 		if allocs == 0 {
 			continue
@@ -114,7 +119,7 @@ func bucketsToPprof(buckets []bpfGobucket, binaryPath string) (*profile.Profile,
 				if !fnExists {
 					var funcName, location string
 					var lineNum int64 = 1
-					
+
 					if symInfo, ok := symbolMap[addr]; ok {
 						funcName = symInfo.name
 						location = symInfo.file
@@ -123,7 +128,7 @@ func bucketsToPprof(buckets []bpfGobucket, binaryPath string) (*profile.Profile,
 						funcName = fmt.Sprintf("func_%x", addr)
 						location = ""
 					}
-					
+
 					fn = &profile.Function{
 						ID:         nextFunctionID,
 						Name:       funcName,
@@ -155,7 +160,7 @@ func bucketsToPprof(buckets []bpfGobucket, binaryPath string) (*profile.Profile,
 		//log.Println("Adding sample with allocs:", allocs, "bytes:", allocBytes, "locations:", len(locations))
 		sample := &profile.Sample{
 			Location: locations,
-			Value:    []int64{int64(allocs), int64(allocBytes)}, // count, bytes
+			Value:    []int64{int64(allocs), int64(allocBytes), int64(inuse), int64(inuseBytes)}, // count, bytes
 		}
 		prof.Sample = append(prof.Sample, sample)
 	}
@@ -181,11 +186,11 @@ type symbolInfo struct {
 // batchResolveSymbols uses a single addr2line call to resolve all addresses at once
 func batchResolveSymbols(binaryPath string, addrs map[uint64]bool) map[uint64]symbolInfo {
 	result := make(map[uint64]symbolInfo)
-	
+
 	if len(addrs) == 0 {
 		return result
 	}
-	
+
 	// Build address list
 	var addrList []string
 	var addrOrder []uint64
@@ -193,10 +198,10 @@ func batchResolveSymbols(binaryPath string, addrs map[uint64]bool) map[uint64]sy
 		addrList = append(addrList, fmt.Sprintf("0x%x", addr))
 		addrOrder = append(addrOrder, addr)
 	}
-	
+
 	log.WithField("count", len(addrList)).Debug("Batch symbolizing addresses")
 	startTime := time.Now()
-	
+
 	// Call addr2line with all addresses at once
 	cmd := exec.Command("addr2line", append([]string{"-e", binaryPath, "-f", "-C"}, addrList...)...)
 	output, err := cmd.Output()
@@ -212,18 +217,18 @@ func batchResolveSymbols(binaryPath string, addrs map[uint64]bool) map[uint64]sy
 		}
 		return result
 	}
-	
+
 	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
-	
+
 	// addr2line outputs 2 lines per address: function name, then file:line
 	for i := 0; i < len(addrOrder) && i*2+1 < len(lines); i++ {
 		addr := addrOrder[i]
 		funcName := strings.TrimSpace(lines[i*2])
 		location := strings.TrimSpace(lines[i*2+1])
-		
+
 		var lineNum int64 = 1
 		var fileName string = location
-		
+
 		// Extract line number if available
 		if parts := strings.Split(location, ":"); len(parts) >= 2 {
 			fileName = parts[0]
@@ -231,21 +236,21 @@ func batchResolveSymbols(binaryPath string, addrs map[uint64]bool) map[uint64]sy
 				lineNum = num
 			}
 		}
-		
+
 		// Use address as function name if symbolization failed
 		if funcName == "??" || location == "??:0" {
 			funcName = fmt.Sprintf("func_%x", addr)
 			fileName = ""
 			lineNum = 0
 		}
-		
+
 		result[addr] = symbolInfo{
 			name: funcName,
 			file: fileName,
 			line: lineNum,
 		}
 	}
-	
+
 	log.WithField("duration", time.Since(startTime)).Debug("Batch symbolization completed")
 	return result
 }
