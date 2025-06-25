@@ -30,7 +30,7 @@ func (b *bpfGobucket) memRecord() *bpfMemRecord {
 	return (*bpfMemRecord)(unsafe.Pointer(uintptr(unsafe.Pointer(&b.Stk[0])) + uintptr(b.Header.Nstk*8)))
 }
 
-func bucketsToPprof(buckets []bpfGobucket, binaryPath string) (*profile.Profile, error) {
+func bucketsToPprof(buckets []bpfGobucket, binaryPath string, buildID string) (*profile.Profile, error) {
 	// Create a new pprof profile
 	prof := &profile.Profile{
 		DefaultSampleType: "inuse_space",
@@ -43,6 +43,19 @@ func bucketsToPprof(buckets []bpfGobucket, binaryPath string) (*profile.Profile,
 		PeriodType: &profile.ValueType{Type: "space", Unit: "bytes"},
 		Period:     512 * 1024, // TODO: read this from process
 		TimeNanos:  time.Now().UnixNano(),
+	}
+
+	// Create a mapping for the binary if we have the path
+	var mainMapping *profile.Mapping
+	if binaryPath != "" {
+		mainMapping = &profile.Mapping{
+			ID:      1,
+			Start:   0,
+			Limit:   ^uint64(0), // Use max uint64 as we don't know the actual size
+			File:    binaryPath,
+			BuildID: buildID,
+		}
+		prof.Mapping = append(prof.Mapping, mainMapping)
 	}
 
 	// Track unique locations and functions
@@ -112,6 +125,7 @@ func bucketsToPprof(buckets []bpfGobucket, binaryPath string) (*profile.Profile,
 				loc = &profile.Location{
 					ID:      nextLocationID,
 					Address: addr,
+					Mapping: mainMapping,
 				}
 				nextLocationID++
 

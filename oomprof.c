@@ -235,7 +235,7 @@ record_profile_buckets(void *ctx, struct ProfileState *state) {
   return 0;
 }
 
-SEC("tracepoint")
+SEC("record_profile_buckets_prog")
 int record_profile_buckets_prog(void *ctx) {
   int key=0;
   struct ProfileState *state = bpf_map_lookup_elem(&profile_state, &key);

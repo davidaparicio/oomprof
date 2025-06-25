@@ -34,6 +34,12 @@ import (
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target $GOARCH -tags linux bpf ../oomprof.c
 
+// ExeInfo holds executable information including path and build ID
+type ExeInfo struct {
+	Path    string
+	BuildID string
+}
+
 // ProfileData holds the profile information to be sent through the channel
 type ProfileData struct {
 	PID            uint32
@@ -91,14 +97,10 @@ func Setup(ctx context.Context, cfg *Config, profileChan chan<- ProfileData) (*S
 	// Fixme: remove entries when process goes away
 	seenMap := make(map[uint32]int64)
 
-	// Create a sync.Map to store pid -> exe path mapping
+	// Create a sync.Map to store pid -> exe info mapping
+	pidToExeInfo := &sync.Map{}
 
-	var pidToExePath *sync.Map
-	if cfg.Symbolize {
-		pidToExePath = &sync.Map{}
-	}
-
-	go monitorEventMap(ctx, &objs.bpfMaps, pidToExePath, profileChan)
+	go monitorEventMap(ctx, &objs.bpfMaps, pidToExeInfo, profileChan)
 
 	log.Debug("Starting main monitoring loop...")
 
@@ -114,7 +116,7 @@ func Setup(ctx context.Context, cfg *Config, profileChan chan<- ProfileData) (*S
 				log.Debug("Context cancelled, shutting down monitoring loop")
 				return
 			default:
-				newProcs, err := scanGoProcesses(ctx, seenMap, pidToExePath)
+				newProcs, err := scanGoProcesses(ctx, seenMap, pidToExeInfo)
 				if err != nil {
 					log.WithError(err).Error("error scanning Go processes")
 					if firstScan {
@@ -211,14 +213,13 @@ func loadBPF() (*bpfObjects, func(), error) {
 		return nil, nil, fmt.Errorf("initializing profile_pid map: %w", err)
 	}
 
-
 	oomMarkVictimTracepoint, err := link.Tracepoint("oom", "mark_victim", objs.OomMarkVictimHandler, nil)
 	if err != nil {
 		objs.Close()
 		return nil, nil, err
 	}
 
-	schedSwitch, err := link.Tracepoint("signal", "signal_deliver", objs.SignalProbe, nil)
+	signalDeliverTP, err := link.Tracepoint("signal", "signal_deliver", objs.SignalProbe, nil)
 	if err != nil {
 		oomMarkVictimTracepoint.Close()
 		objs.Close()
@@ -230,16 +231,16 @@ func loadBPF() (*bpfObjects, func(), error) {
 	}
 
 	// Register tail call program for bucket processing
-	tailCallIndex := uint32(0)  // RECORD_PROFILE_BUCKETS_PROG = 0
+	tailCallIndex := uint32(0) // RECORD_PROFILE_BUCKETS_PROG = 0
 	if err := objs.TailCallMap.Put(tailCallIndex, objs.RecordProfileBucketsProg); err != nil {
-		schedSwitch.Close()
+		signalDeliverTP.Close()
 		oomMarkVictimTracepoint.Close()
 		objs.Close()
 		return nil, nil, fmt.Errorf("registering tail call program: %v", err)
 	}
 
 	return &objs, func() {
-		schedSwitch.Close()
+		signalDeliverTP.Close()
 		oomMarkVictimTracepoint.Close()
 		objs.Close()
 	}, nil
@@ -306,7 +307,7 @@ func (s *State) ProfilePid(ctx context.Context, pid uint32) error {
 	}
 }
 
-func readProfile(maps *bpfMaps, numBuckets uint32, binaryPath string) (*profile.Profile, error) {
+func readProfile(maps *bpfMaps, numBuckets uint32, binaryPath string, buildID string) (*profile.Profile, error) {
 	const maxBatchSize = uint32(32) // Adjust based on your needs and kernel limits
 
 	var allBuckets []bpfGobucket
@@ -348,7 +349,7 @@ func readProfile(maps *bpfMaps, numBuckets uint32, binaryPath string) (*profile.
 
 	// Convert to pprof format
 	convertStart := time.Now()
-	prof, err := bucketsToPprof(allBuckets, binaryPath)
+	prof, err := bucketsToPprof(allBuckets, binaryPath, buildID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to convert buckets to pprof: %v", err)
 	}
@@ -357,7 +358,7 @@ func readProfile(maps *bpfMaps, numBuckets uint32, binaryPath string) (*profile.
 	return prof, nil
 }
 
-func monitorEventMap(ctx context.Context, maps *bpfMaps, pidToExePath *sync.Map, profileChan chan<- ProfileData) {
+func monitorEventMap(ctx context.Context, maps *bpfMaps, pidToExeInfo *sync.Map, profileChan chan<- ProfileData) {
 	eventReader, err := perf.NewReader(maps.SignalEvents, 1)
 	if err != nil {
 		log.WithError(err).Error("error creating perf reader")
@@ -408,29 +409,28 @@ func monitorEventMap(ctx context.Context, maps *bpfMaps, pidToExePath *sync.Map,
 				}
 				log.WithFields(log.Fields{"pid": pid, "buckets": gop.NumBuckets}).Debug("Found Go process")
 
-				// Retrieve the binary path from the sync.Map
-				binaryPath := ""
-				if pidToExePath != nil {
-					if pathValue, ok := pidToExePath.Load(pid); ok {
-						binaryPath = pathValue.(string)
-					} else {
-						log.WithField("pid", pid).Debug("binary path not found for PID")
-					}
+				// Retrieve the exe info from the sync.Map
+				var exeInfo *ExeInfo
+				if infoValue, ok := pidToExeInfo.Load(pid); ok {
+					exeInfo = infoValue.(*ExeInfo)
+				} else {
+					log.WithField("pid", pid).Debug("exe info not found for PID")
+					exeInfo = &ExeInfo{Path: "", BuildID: ""}
 				}
 
-				prof, err := readProfile(maps, gop.NumBuckets, binaryPath)
+				prof, err := readProfile(maps, gop.NumBuckets, exeInfo.Path, exeInfo.BuildID)
 				if err != nil {
 					log.WithError(err).WithField("pid", pid).Error("error reading profile for PID")
 				} else {
 					log.WithField("pid", pid).Debug("Successfully read profile for PID")
 					// Extract command name from exe path
 					command := "unknown"
-					if binaryPath != "" {
+					if exeInfo.Path != "" {
 						// Get just the basename of the binary path
-						if idx := strings.LastIndex(binaryPath, "/"); idx != -1 {
-							command = binaryPath[idx+1:]
+						if idx := strings.LastIndex(exeInfo.Path, "/"); idx != -1 {
+							command = exeInfo.Path[idx+1:]
 						} else {
-							command = binaryPath
+							command = exeInfo.Path
 						}
 					}
 					// Send profile data through channel
@@ -445,7 +445,7 @@ func monitorEventMap(ctx context.Context, maps *bpfMaps, pidToExePath *sync.Map,
 						MaxStackErrors: gop.MaxStackErrors,
 					}:
 						log.WithFields(log.Fields{
-							"pid": pid,
+							"pid":           pid,
 							"send_duration": time.Since(sendStart),
 						}).Info("Successfully sent profile to channel")
 						// Clear the profile_pid map after successfully sending the profile

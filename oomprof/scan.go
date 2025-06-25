@@ -27,7 +27,7 @@ import (
 
 // scanGoProcesses scans the /proc filesystem for running Go processes
 // and returns a slice of GoProcessInfo structs with PID and mbuckets address
-func scanGoProcesses(ctx context.Context, goProcs map[uint32]int64, pidToExePath *sync.Map) ([]GoProcessInfo, error) {
+func scanGoProcesses(ctx context.Context, goProcs map[uint32]int64, pidToExeInfo *sync.Map) ([]GoProcessInfo, error) {
 	var results []GoProcessInfo
 
 	// Open /proc directory
@@ -117,6 +117,13 @@ func scanGoProcesses(ctx context.Context, goProcs map[uint32]int64, pidToExePath
 			continue
 		}
 
+		// Get the BuildID
+		buildID, err := elfFile.GetBuildID()
+		if err != nil {
+			log.WithError(err).WithField("pid", pid).Debug("error getting build ID for PID")
+			buildID = "" // Use empty string if we can't get the build ID
+		}
+
 		symtab, err := elfFile.ReadSymbols()
 		if err != nil {
 			log.WithError(err).WithFields(log.Fields{"cmdline": cmdlineStr, "go_version": goVersion, "pid": pid}).Debug("error looking up symbol table")
@@ -133,12 +140,15 @@ func scanGoProcesses(ctx context.Context, goProcs map[uint32]int64, pidToExePath
 		}
 
 		goProcs[uint32(pid)] = int64(mbucketsAddr.Address)
-		log.WithFields(log.Fields{"pid": pid, "mbuckets": fmt.Sprintf("%x", mbucketsAddr.Address), "comm": strings.TrimSpace(string(comm)), "cmdline": cmdlineStr}).Debug("Found Go program")
+		log.WithFields(log.Fields{"pid": pid, "mbuckets": fmt.Sprintf("%x", mbucketsAddr.Address), "comm": strings.TrimSpace(string(comm)), "cmdline": cmdlineStr, "buildid": buildID}).Debug("Found Go program")
 
-		// Store the PID to exe path mapping in the sync.Map
-		if pidToExePath != nil {
-			pidToExePath.Store(uint32(pid), realExePath)
+		// Store the PID to exe info mapping in the sync.Map
+		exeInfo := &ExeInfo{
+			Path:    realExePath,
+			BuildID: buildID,
 		}
+		pidToExeInfo.Store(uint32(pid), exeInfo)
+
 		// Create a GoProcessInfo struct and add it to our results
 		procInfo := GoProcessInfo{
 			PID:          uint32(pid),
