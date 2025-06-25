@@ -42,6 +42,7 @@ func bucketsToPprof(buckets []bpfGobucket, binaryPath string) (*profile.Profile,
 		},
 		PeriodType: &profile.ValueType{Type: "space", Unit: "bytes"},
 		Period:     512 * 1024, // TODO: read this from process
+		TimeNanos:  time.Now().UnixNano(),
 	}
 
 	// Track unique locations and functions
