@@ -7,7 +7,7 @@ OOMProf is an eBPF-based process monitor that automatically captures heap profil
 - **Real-time Go process detection**: Automatically discovers and monitors running Go programs
 - **Pre-OOM profiling**: Captures memory profiles at the moment of OOM kill signals
 - **On-demand profiling**: Profile specific processes by PID using the `-p` flag
-- **eBPF-powered monitoring**: Uses kernel tracepoints for low-overhead process monitoring
+- **eBPF-powered monitoring**: Uses kernel tracepoints for low-overhead and stable process monitoring
 - **Standard pprof output**: Generates profiles compatible with Go's pprof toolchain
 - **Memory limit testing**: Includes cgroup-based testing framework for reproducible OOM scenarios
 
@@ -41,7 +41,7 @@ make
 
 This creates:
 - `oompa` - Main OOMProf monitor (OOM Profiler Agent)
-- `tests/oomer.taux` - Test binary for generating OOM conditions  
+- `tests/oomer.taux` - Test binary for generating OOM conditions
 - `tests/gccache.taux` - Test binary for GC cache stress testing
 - `oomprof.test` - Test suite
 
@@ -55,7 +55,7 @@ Run OOMProf as root to monitor all Go processes:
 sudo ./oompa
 ```
 
-When a Go process is OOM killed, OOMProf will automatically generate a profile file named `{command}-{pid}.pb.gz`.
+When a Go process is OOM killed, `oompa` will automatically generate a profile file named `{command}-{pid}.pb.gz`.
 
 ### On-Demand Profiling
 
@@ -86,6 +86,51 @@ go tool pprof -http=:8080 {command}-{pid}.pb.gz
 go tool pprof -top {command}-{pid}.pb.gz
 ```
 
+### Programmatic Usage
+
+OOMProf can be used as a library in your own applications:
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "log"
+    "os"
+    "time"
+
+    "github.com/parca-dev/oomprof/oomprof"
+)
+
+func main() {
+    profileChan := make(chan oomprof.ProfileData)
+    state, err := oomprof.Setup(context.Background(), &oomprof.Config{}, profileChan)
+    if err != nil {
+        fmt.Fprintf(os.Stderr, "Failed to setup OOM profiler: %v\n", err)
+        os.Exit(1)
+    }
+    defer state.Close()
+
+    for profile := range profileChan {
+        // Create filename with timestamp: command-pid-YYYYMMDDHHmmss.pb.gz
+        timestamp := time.Now().Format("20060102150405")
+        filename := fmt.Sprintf("%s-%d-%s.pb.gz", profile.Command, profile.PID, timestamp)
+
+        f, err := os.Create(filename)
+        if err != nil {
+            log.Printf("Failed to create profile file %s: %v\n", filename, err)
+            continue
+        }
+        if err := profile.Profile.Write(f); err != nil {
+            log.Printf("Failed to write profile %s: %v\n", filename, err)
+        }
+        f.Close()
+        log.Printf("Saved profile for %s (PID %d) to %s\n", profile.Command, profile.PID, filename)
+    }
+}
+```
+
 ### Testing with Controlled OOM
 
 Test OOMProf with the included test binaries:
@@ -109,7 +154,7 @@ sudo go test -v ./oomprof -run TestOOMProfLowMemoryLimits
 
 ```
 ┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
-│   Go Process    │    │ eBPF Tracepoints │    │   OOMProf       │
+│   Go Process    │    │       eBPF       │    │   OOMProf       │
 │                 │    │                  │    │                 │
 │ ┌─────────────┐ │    │ ┌──────────────┐ │    │ ┌─────────────┐ │
 │ │ Memory      │ │    │ │ oom/mark_    │ │    │ │ Process     │ │
@@ -118,11 +163,12 @@ sudo go test -v ./oomprof -run TestOOMProfLowMemoryLimits
 │ └─────────────┘ │    │ │ signal_      │ │    │ └─────────────┘ │
 │                 │    │ │ deliver      │ │    │                 │
 │ ┌─────────────┐ │    │ └──────────────┘ │    │ ┌─────────────┐ │
-│ │ runtime.    │ │    │                  │    │ │ Profile     │ │
-│ │ mbuckets    │ │◀───┼──────────────────┼────│ │ Generator   │ │
-│ └─────────────┘ │    │                  │    │ └─────────────┘ │
-└─────────────────┘    └──────────────────┘    └─────────────────┘
-```
+│ │ runtime.    │ │    │ ┌──────────────┐ │    │ │ Profile     │ │
+│ │ mbuckets    │ │◀───┼─┤ record_      │ ├────┼▶│ Generator   │ │
+│ └─────────────┘ │    │ │ profile_     │ │    │ └─────────────┘ │
+│                 │    │ │ buckets      │ │    │                 │
+└─────────────────┘    │ └──────────────┘ │    └─────────────────┘
+                       └──────────────────┘
 
 ## Development
 
@@ -169,7 +215,7 @@ oomprof/
 - [ ] Kubernetes/cgroup deployment support
 - [ ] Remote profile upload (pprof.me integration)
 - [ ] Integration with standard observability reporters
-- [ ] Rust jemalloc support
+- [ ] jemalloc/tcmalloc/mimalloc support
 - [ ] Python memory profiling
 
 ## Contributing
