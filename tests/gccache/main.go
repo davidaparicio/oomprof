@@ -19,8 +19,6 @@ import (
 	"math/rand"
 	"runtime"
 	"time"
-
-	"parca.dev/oomprof/oomprof"
 )
 
 // CacheEntry represents an entry in our leaky cache
@@ -112,7 +110,11 @@ func main() {
 	// Enable memory profiling for this process
 	runtime.MemProfile(nil, false)
 
-	time.Sleep(oomprof.TestSleep)
+	// Busy sleep for 5 seconds in 1ms chunks
+	start := time.Now()
+	for time.Since(start) < 15*time.Second {
+		time.Sleep(0)
+	}
 
 	var entrySize int
 	var addRate int

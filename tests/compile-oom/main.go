@@ -15,7 +15,7 @@ package main
 
 import "fmt"
 
-// zhttps://github.com/golang/go/issues/72063
+// https://github.com/golang/go/issues/72063
 // Y is the Y-combinator based on https://dreamsongs.com/Files/WhyOfY.pdf
 func Y[Endo ~func(RecFct) RecFct, RecFct ~func(T) R, T, R any](f Endo) RecFct {
 

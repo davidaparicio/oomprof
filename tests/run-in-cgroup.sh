@@ -22,5 +22,4 @@ export GOTOOLCHAIN=$GOTOOLCHAIN
 export GODEBUG=$GODEBUG
 export GOMODCACHE=$GOMODECACHE
 
-# Exec the command (replace this process)
 "$COMMAND" "$@"

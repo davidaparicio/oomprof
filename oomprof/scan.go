@@ -165,11 +165,16 @@ func scanGoProcesses(ctx context.Context, goProcs map[uint32]int64, pidToExeInfo
 	return results, nil
 }
 
-// GoProcessInfo holds information about a running Go process
+// GoProcessInfo holds information about a running Go process.
 type GoProcessInfo struct {
-	PID          uint32 // Process ID
-	GoVersion    string // Go version
-	MBucketsAddr uint64 // Address of mbuckets
-	CmdLine      string // Command line
-	ExePath      string // Path to executable
+	// PID is the process ID.
+	PID          uint32
+	// GoVersion is the Go version of the process.
+	GoVersion    string
+	// MBucketsAddr is the address of the mbuckets symbol in memory.
+	MBucketsAddr uint64
+	// CmdLine is the command line used to start the process.
+	CmdLine      string
+	// ExePath is the path to the executable.
+	ExePath      string
 }

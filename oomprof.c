@@ -151,10 +151,10 @@ struct {
 
 struct {
   __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
-  //__type(key, u32);
+  __type(key, u32);
   //__type(value, u32);  // Should be u32 (file descriptor)
   //__uint(max_entries, 1024);
-  __type(value, struct Event);
+  //__type(value, struct Event);
 } signal_events SEC(".maps");
 
 // Dummy map just to export the struct - never actually used
@@ -235,7 +235,7 @@ record_profile_buckets(void *ctx, struct ProfileState *state) {
   return 0;
 }
 
-SEC("record_profile_buckets_prog")
+SEC("tracepoint/record_profile_buckets_tail_call")
 int record_profile_buckets_prog(void *ctx) {
   int key=0;
   struct ProfileState *state = bpf_map_lookup_elem(&profile_state, &key);
@@ -287,9 +287,9 @@ int signal_probe(struct trace_event_raw_signal_deliver *ctx) {
   pid_t pid = bpf_get_current_pid_tgid() >> 32;
   struct GoProc* gop = bpf_map_lookup_elem(&go_procs, &pid);
   if (!gop) {
-    DEBUG_PRINT("signal_probe: go_procs lookup failed: %d\n", pid);
     return 0;
   }
+  //DEBUG_PRINT("signal_probe: go_procs lookup succeeded: %d\n", pid);
 
   int key=0;
   pid_t *target_pid = bpf_map_lookup_elem(&profile_pid, &key);
@@ -298,9 +298,9 @@ int signal_probe(struct trace_event_raw_signal_deliver *ctx) {
     return 0;
   }
   if (*target_pid != pid) {
-    DEBUG_PRINT("signal_probe: target pid not current pid, ignoring signal\n");
     return 0;
   }
+  DEBUG_PRINT("signal_probe: target pid == current pid, proceeding\n");
   // num_buckets reset after reading, ignore if not zero.
   if (gop->num_buckets > 0) {
     DEBUG_PRINT("signal_probe: already recorded profile for pid %d, ignoring signal\n", pid);

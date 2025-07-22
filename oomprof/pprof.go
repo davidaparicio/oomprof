@@ -30,7 +30,7 @@ func (b *bpfGobucket) memRecord() *bpfMemRecord {
 	return (*bpfMemRecord)(unsafe.Pointer(uintptr(unsafe.Pointer(&b.Stk[0])) + uintptr(b.Header.Nstk*8)))
 }
 
-func bucketsToPprof(buckets []bpfGobucket, binaryPath string, buildID string) (*profile.Profile, error) {
+func bucketsToPprof(buckets []bpfGobucket, binaryPath string, buildID string, symbolize bool) (*profile.Profile, error) {
 	// Create a new pprof profile
 	prof := &profile.Profile{
 		DefaultSampleType: "inuse_space",
@@ -87,7 +87,7 @@ func bucketsToPprof(buckets []bpfGobucket, binaryPath string, buildID string) (*
 
 	// Batch symbolize all addresses at once
 	symbolMap := make(map[uint64]symbolInfo)
-	if binaryPath != "" && len(uniqueAddrs) > 0 {
+	if binaryPath != "" && len(uniqueAddrs) > 0 && symbolize {
 		symbolMap = batchResolveSymbols(binaryPath, uniqueAddrs)
 	}
 
@@ -130,7 +130,7 @@ func bucketsToPprof(buckets []bpfGobucket, binaryPath string, buildID string) (*
 				nextLocationID++
 
 				// Create a function for this location using symbol resolution
-				fn, fnExists := functionMap[addr]
+				_, fnExists := functionMap[addr]
 				if !fnExists {
 					var funcName, location string
 					var lineNum int64 = 1
@@ -139,29 +139,27 @@ func bucketsToPprof(buckets []bpfGobucket, binaryPath string, buildID string) (*
 						funcName = symInfo.name
 						location = symInfo.file
 						lineNum = symInfo.line
-					} else {
-						funcName = fmt.Sprintf("func_%x", addr)
-						location = ""
-					}
 
-					fn = &profile.Function{
-						ID:         nextFunctionID,
-						Name:       funcName,
-						SystemName: funcName,
-						Filename:   location,
-						StartLine:  lineNum,
-					}
-					nextFunctionID++
-					functionMap[addr] = fn
-					prof.Function = append(prof.Function, fn)
-				}
+						fn := &profile.Function{
+							ID:         nextFunctionID,
+							Name:       funcName,
+							SystemName: funcName,
+							Filename:   location,
+							StartLine:  lineNum,
+						}
+						nextFunctionID++
+						functionMap[addr] = fn
+						prof.Function = append(prof.Function, fn)
 
-				// Add function to location
-				loc.Line = []profile.Line{
-					{
-						Function: fn,
-						Line:     1,
-					},
+						// Add function to location
+						loc.Line = []profile.Line{
+							{
+								Function: fn,
+								Line:     1,
+							},
+						}
+
+					}
 				}
 
 				locationMap[addr] = loc

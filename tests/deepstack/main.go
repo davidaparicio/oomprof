@@ -46,12 +46,24 @@ func func0(cs callStack) {
 	newCS := cs.markCalled(0)
 
 	// Call all other functions that haven't been called yet
-	if newCS.canCall(1) { func1(newCS) }
-	if newCS.canCall(2) { func2(newCS) }
-	if newCS.canCall(3) { func3(newCS) }
-	if newCS.canCall(4) { func4(newCS) }
-	if newCS.canCall(5) { func5(newCS) }
-	if newCS.canCall(6) { func6(newCS) }
+	if newCS.canCall(1) {
+		func1(newCS)
+	}
+	if newCS.canCall(2) {
+		func2(newCS)
+	}
+	if newCS.canCall(3) {
+		func3(newCS)
+	}
+	if newCS.canCall(4) {
+		func4(newCS)
+	}
+	if newCS.canCall(5) {
+		func5(newCS)
+	}
+	if newCS.canCall(6) {
+		func6(newCS)
+	}
 }
 
 func func1(cs callStack) {
@@ -62,12 +74,24 @@ func func1(cs callStack) {
 	newCS := cs.markCalled(1)
 
 	// Call all other functions that haven't been called yet
-	if newCS.canCall(0) { func0(newCS) }
-	if newCS.canCall(2) { func2(newCS) }
-	if newCS.canCall(3) { func3(newCS) }
-	if newCS.canCall(4) { func4(newCS) }
-	if newCS.canCall(5) { func5(newCS) }
-	if newCS.canCall(6) { func6(newCS) }
+	if newCS.canCall(0) {
+		func0(newCS)
+	}
+	if newCS.canCall(2) {
+		func2(newCS)
+	}
+	if newCS.canCall(3) {
+		func3(newCS)
+	}
+	if newCS.canCall(4) {
+		func4(newCS)
+	}
+	if newCS.canCall(5) {
+		func5(newCS)
+	}
+	if newCS.canCall(6) {
+		func6(newCS)
+	}
 }
 
 func func2(cs callStack) {
@@ -78,12 +102,24 @@ func func2(cs callStack) {
 	newCS := cs.markCalled(2)
 
 	// Call all other functions that haven't been called yet
-	if newCS.canCall(0) { func0(newCS) }
-	if newCS.canCall(1) { func1(newCS) }
-	if newCS.canCall(3) { func3(newCS) }
-	if newCS.canCall(4) { func4(newCS) }
-	if newCS.canCall(5) { func5(newCS) }
-	if newCS.canCall(6) { func6(newCS) }
+	if newCS.canCall(0) {
+		func0(newCS)
+	}
+	if newCS.canCall(1) {
+		func1(newCS)
+	}
+	if newCS.canCall(3) {
+		func3(newCS)
+	}
+	if newCS.canCall(4) {
+		func4(newCS)
+	}
+	if newCS.canCall(5) {
+		func5(newCS)
+	}
+	if newCS.canCall(6) {
+		func6(newCS)
+	}
 }
 
 func func3(cs callStack) {
@@ -94,12 +130,24 @@ func func3(cs callStack) {
 	newCS := cs.markCalled(3)
 
 	// Call all other functions that haven't been called yet
-	if newCS.canCall(0) { func0(newCS) }
-	if newCS.canCall(1) { func1(newCS) }
-	if newCS.canCall(2) { func2(newCS) }
-	if newCS.canCall(4) { func4(newCS) }
-	if newCS.canCall(5) { func5(newCS) }
-	if newCS.canCall(6) { func6(newCS) }
+	if newCS.canCall(0) {
+		func0(newCS)
+	}
+	if newCS.canCall(1) {
+		func1(newCS)
+	}
+	if newCS.canCall(2) {
+		func2(newCS)
+	}
+	if newCS.canCall(4) {
+		func4(newCS)
+	}
+	if newCS.canCall(5) {
+		func5(newCS)
+	}
+	if newCS.canCall(6) {
+		func6(newCS)
+	}
 }
 
 func func4(cs callStack) {
@@ -110,12 +158,24 @@ func func4(cs callStack) {
 	newCS := cs.markCalled(4)
 
 	// Call all other functions that haven't been called yet
-	if newCS.canCall(0) { func0(newCS) }
-	if newCS.canCall(1) { func1(newCS) }
-	if newCS.canCall(2) { func2(newCS) }
-	if newCS.canCall(3) { func3(newCS) }
-	if newCS.canCall(5) { func5(newCS) }
-	if newCS.canCall(6) { func6(newCS) }
+	if newCS.canCall(0) {
+		func0(newCS)
+	}
+	if newCS.canCall(1) {
+		func1(newCS)
+	}
+	if newCS.canCall(2) {
+		func2(newCS)
+	}
+	if newCS.canCall(3) {
+		func3(newCS)
+	}
+	if newCS.canCall(5) {
+		func5(newCS)
+	}
+	if newCS.canCall(6) {
+		func6(newCS)
+	}
 }
 
 func func5(cs callStack) {
@@ -126,12 +186,24 @@ func func5(cs callStack) {
 	newCS := cs.markCalled(5)
 
 	// Call all other functions that haven't been called yet
-	if newCS.canCall(0) { func0(newCS) }
-	if newCS.canCall(1) { func1(newCS) }
-	if newCS.canCall(2) { func2(newCS) }
-	if newCS.canCall(3) { func3(newCS) }
-	if newCS.canCall(4) { func4(newCS) }
-	if newCS.canCall(6) { func6(newCS) }
+	if newCS.canCall(0) {
+		func0(newCS)
+	}
+	if newCS.canCall(1) {
+		func1(newCS)
+	}
+	if newCS.canCall(2) {
+		func2(newCS)
+	}
+	if newCS.canCall(3) {
+		func3(newCS)
+	}
+	if newCS.canCall(4) {
+		func4(newCS)
+	}
+	if newCS.canCall(6) {
+		func6(newCS)
+	}
 }
 
 func func6(cs callStack) {
@@ -142,12 +214,24 @@ func func6(cs callStack) {
 	newCS := cs.markCalled(6)
 
 	// Call all other functions that haven't been called yet
-	if newCS.canCall(0) { func0(newCS) }
-	if newCS.canCall(1) { func1(newCS) }
-	if newCS.canCall(2) { func2(newCS) }roofing
-	if newCS.canCall(3) { func3(newCS) }
-	if newCS.canCall(4) { func4(newCS) }
-	if newCS.canCall(5) { func5(newCS) }
+	if newCS.canCall(0) {
+		func0(newCS)
+	}
+	if newCS.canCall(1) {
+		func1(newCS)
+	}
+	if newCS.canCall(2) {
+		func2(newCS)
+	}
+	if newCS.canCall(3) {
+		func3(newCS)
+	}
+	if newCS.canCall(4) {
+		func4(newCS)
+	}
+	if newCS.canCall(5) {
+		func5(newCS)
+	}
 }
 
 func main() {

@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/containerd/cgroups/v3/cgroup2"
+	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 )
 
@@ -80,6 +81,7 @@ var testCfg = Config{
 }
 
 func TestOOMProf(t *testing.T) {
+	log.SetLevel(log.DebugLevel)
 	// Check if go is available to decide which test to run
 	_, goAvailable := exec.LookPath("go")
 
@@ -119,10 +121,10 @@ func testOOMProfWithMemLimit(t *testing.T, memLimitMB int64) {
 	profileChan := make(chan ProfileData, 10)
 
 	// Start OOM profiler
-	_, close, err := Setup(ctx, &testCfg, profileChan)
+	state, err := Setup(ctx, &testCfg, profileChan)
 	require.NoError(t, err)
 
-	defer close()
+	defer state.Close()
 
 	profRateAll := []string{"GODEBUG=memprofilerate=1", "HOME=/root"}
 
@@ -410,9 +412,9 @@ func testOOMProfQEMUSimple(t *testing.T) {
 		Verbose:      true,
 	}
 	// Start OOM profiler
-	_, closer, err := Setup(ctx, &cfg, profileChan)
+	state, err := Setup(ctx, &cfg, profileChan)
 	require.NoError(t, err)
-	defer closer()
+	defer state.Close()
 
 	profRateAll := []string{"GODEBUG=memprofilerate=1", "HOME=/root"}
 
@@ -497,4 +499,149 @@ func testOOMProfQEMUSimple(t *testing.T) {
 
 	// Cancel context to clean up
 	cancel()
+}
+
+func TestSingletonSetup(t *testing.T) {
+	// Skip if not root
+	if os.Getuid() != 0 {
+		t.Skip("Test requires root privileges")
+	}
+
+	t.Run("GetStateBeforeSetup", func(t *testing.T) {
+		// Reset singleton state for clean test
+		setupMutex.Lock()
+		globalState = nil
+		isInitialized = false
+		setupMutex.Unlock()
+
+		_, err := GetState()
+		require.ErrorIs(t, err, ErrNotInitialized)
+	})
+
+	t.Run("SingleSetup", func(t *testing.T) {
+		// Reset singleton state for clean test
+		setupMutex.Lock()
+		globalState = nil
+		isInitialized = false
+		setupMutex.Unlock()
+
+		ctx := context.Background()
+		profileChan := make(chan ProfileData, 10)
+
+		cfg := &Config{
+			ScanInterval: 100 * time.Millisecond,
+			Verbose:      false,
+			LogTracePipe: false,
+			Symbolize:    false,
+		}
+
+		state, err := Setup(ctx, cfg, profileChan)
+		require.NoError(t, err)
+		require.NotNil(t, state)
+
+		// Test GetState returns the same instance
+		retrievedState, err := GetState()
+		require.NoError(t, err)
+		require.Equal(t, state, retrievedState)
+
+		state.Close()
+
+		// After cleanup, GetState should return error
+		_, err = GetState()
+		require.ErrorIs(t, err, ErrNotInitialized)
+	})
+
+	t.Run("DoubleSetup", func(t *testing.T) {
+		// Reset singleton state for clean test
+		setupMutex.Lock()
+		globalState = nil
+		isInitialized = false
+		setupMutex.Unlock()
+
+		ctx := context.Background()
+		profileChan1 := make(chan ProfileData, 10)
+		profileChan2 := make(chan ProfileData, 10)
+
+		cfg := &Config{
+			ScanInterval: 100 * time.Millisecond,
+			Verbose:      false,
+			LogTracePipe: false,
+			Symbolize:    false,
+		}
+
+		// First setup should succeed
+		state1, err := Setup(ctx, cfg, profileChan1)
+		require.NoError(t, err)
+
+		// Second setup should fail
+		_, err = Setup(ctx, cfg, profileChan2)
+		require.ErrorIs(t, err, ErrAlreadyInitialized)
+
+		state1.Close()
+	})
+
+	t.Run("SetupWithReporterDoubleSetup", func(t *testing.T) {
+		// Reset singleton state for clean test
+		setupMutex.Lock()
+		globalState = nil
+		isInitialized = false
+		setupMutex.Unlock()
+
+		ctx := context.Background()
+
+		cfg := &Config{
+			ScanInterval: 100 * time.Millisecond,
+			Verbose:      false,
+			LogTracePipe: false,
+			Symbolize:    false,
+		}
+
+		// First setup with reporter should succeed
+		state1, err := SetupWithReporter(ctx, cfg, nil) // nil reporter for testing
+		require.NoError(t, err)
+
+		// Second setup (different type) should also fail
+		profileChan := make(chan ProfileData, 10)
+		_, err = Setup(ctx, cfg, profileChan)
+		require.ErrorIs(t, err, ErrAlreadyInitialized)
+
+		state1.Close()
+	})
+}
+
+func TestWatchPidSelfWatch(t *testing.T) {
+	// Skip if not root
+	if os.Getuid() != 0 {
+		t.Skip("Test requires root privileges")
+	}
+
+	// Reset singleton state for clean test
+	setupMutex.Lock()
+	globalState = nil
+	isInitialized = false
+	setupMutex.Unlock()
+
+	ctx := context.Background()
+	profileChan := make(chan ProfileData, 10)
+
+	cfg := &Config{
+		ScanInterval: 100 * time.Millisecond,
+		Verbose:      false,
+		LogTracePipe: false,
+		Symbolize:    false,
+	}
+
+	state, err := Setup(ctx, cfg, profileChan)
+	require.NoError(t, err)
+	defer state.Close()
+
+	// Try to watch our own PID - should return ErrSelfWatch
+	currentPID := uint32(os.Getpid())
+	err = state.WatchPid(currentPID)
+	require.ErrorIs(t, err, ErrSelfWatch)
+
+	// Watching a different PID should work (even if it doesn't exist)
+	differentPID := currentPID + 1
+	err = state.WatchPid(differentPID)
+	require.NoError(t, err) // Should not error even if PID doesn't exist
 }

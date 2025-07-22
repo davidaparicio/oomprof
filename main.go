@@ -26,8 +26,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/parca-dev/oomprof/oomprof"
 	log "github.com/sirupsen/logrus"
-	"parca.dev/oomprof/oomprof"
 )
 
 func main() {
@@ -58,12 +58,12 @@ func main() {
 		Symbolize:    true,
 		LogTracePipe: debug,
 	}
-	state, clos, err := oomprof.Setup(ctx, &cfg, profileChan)
+	state, err := oomprof.Setup(ctx, &cfg, profileChan)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to setup OOM profiler: %v\n", err)
 		os.Exit(1)
 	}
-	defer clos()
+	defer state.Close()
 
 	// Start goroutine to write profiles to disk
 	var wg sync.WaitGroup
@@ -73,13 +73,13 @@ func main() {
 		log.Debug("Profile writer goroutine started")
 		for profile := range profileChan {
 			log.WithFields(log.Fields{"pid": profile.PID, "command": profile.Command}).Debug("Received profile")
-			
+
 			// Skip empty profiles
 			if profile.Profile == nil || len(profile.Profile.Sample) == 0 {
 				log.WithField("pid", profile.PID).Debug("Skipping empty profile")
 				continue
 			}
-			
+
 			// Create filename with timestamp: command-pid-YYYYMMDDHHmmss.pb.gz
 			timestamp := time.Now().Format("20060102150405")
 			filename := fmt.Sprintf("%s-%d-%s.pb.gz", profile.Command, profile.PID, timestamp)
