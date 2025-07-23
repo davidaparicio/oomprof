@@ -1,5 +1,4 @@
 ci-kernels*
-oomprof/bpf*
 tests/*.taux
 *.pb.gz
 oompa

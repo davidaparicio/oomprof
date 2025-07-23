@@ -13,7 +13,7 @@ require (
 	go.opentelemetry.io/ebpf-profiler v0.0.0-20250519164423-009a07f3803c
 )
 
-replace go.opentelemetry.io/ebpf-profiler => github.com/parca-dev/opentelemetry-ebpf-profiler v0.0.0-20250723163006-6ef58876b286
+replace go.opentelemetry.io/ebpf-profiler => github.com/parca-dev/opentelemetry-ebpf-profiler v0.0.0-20250723174028-e4e60d5df998
 
 require (
 	github.com/containerd/log v0.1.0 // indirect
