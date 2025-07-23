@@ -1,9 +1,10 @@
 module github.com/parca-dev/oomprof
-go 1.24.0
+
+go 1.23.6
 
 require (
 	github.com/KimMachineGun/automemlimit v0.7.3
-	github.com/cilium/ebpf v0.18.0
+	github.com/cilium/ebpf v0.19.0
 	github.com/containerd/cgroups/v3 v3.0.5
 	github.com/elastic/go-freelru v0.16.0
 	github.com/google/pprof v0.0.0-20250607225305-033d6d78b36a
@@ -12,7 +13,7 @@ require (
 	go.opentelemetry.io/ebpf-profiler v0.0.0-20250519164423-009a07f3803c
 )
 
-replace go.opentelemetry.io/ebpf-profiler => ../parca-prof
+replace go.opentelemetry.io/ebpf-profiler => github.com/parca-dev/opentelemetry-ebpf-profiler v0.0.0-20250723163006-6ef58876b286
 
 require (
 	github.com/containerd/log v0.1.0 // indirect
@@ -31,17 +32,17 @@ require (
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/rogpeppe/go-internal v1.13.1 // indirect
 	github.com/zeebo/xxh3 v1.0.2 // indirect
-	go.opentelemetry.io/collector/consumer v1.22.0 // indirect
-	go.opentelemetry.io/collector/consumer/xconsumer v0.116.0 // indirect
-	go.opentelemetry.io/collector/pdata v1.22.0 // indirect
-	go.opentelemetry.io/collector/pdata/pprofile v0.116.0 // indirect
-	go.opentelemetry.io/otel v1.35.0 // indirect
+	go.opentelemetry.io/collector/consumer v1.35.0 // indirect
+	go.opentelemetry.io/collector/consumer/xconsumer v0.129.0 // indirect
+	go.opentelemetry.io/collector/pdata v1.35.0 // indirect
+	go.opentelemetry.io/collector/pdata/pprofile v0.129.0 // indirect
+	go.opentelemetry.io/otel v1.37.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
-	golang.org/x/net v0.38.0 // indirect
-	golang.org/x/sys v0.32.0 // indirect
-	golang.org/x/text v0.23.0 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20250102185135-69823020774d // indirect
-	google.golang.org/grpc v1.69.2 // indirect
-	google.golang.org/protobuf v1.36.1 // indirect
+	golang.org/x/net v0.39.0 // indirect
+	golang.org/x/sys v0.33.0 // indirect
+	golang.org/x/text v0.24.0 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20250324211829-b45e905df463 // indirect
+	google.golang.org/grpc v1.73.0 // indirect
+	google.golang.org/protobuf v1.36.6 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
