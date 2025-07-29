@@ -37,6 +37,7 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/libpf/pfelf"
 	"go.opentelemetry.io/ebpf-profiler/support"
+	"go.opentelemetry.io/ebpf-profiler/traceutil"
 
 	"go.opentelemetry.io/ebpf-profiler/reporter"
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
@@ -112,11 +113,12 @@ type State struct {
 	seenPIDs *lru.SyncedLRU[uint32, struct{}]
 	config   *Config
 	// labels stores pprof labels captured during ProfilePid calls
-	labels pprof.LabelSet
+	labels map[string]string
 	// cleanup resources
 	signalDeliverTP link.Link
 	oomMarkVictimTP link.Link
 	bpfObjects      *bpfObjects
+	oomdPids        *lru.SyncedLRU[uint32, struct{}] // LRU cache for oomd PIDs
 }
 
 // Config contains configuration options for oomprof.
@@ -181,6 +183,13 @@ func SetupWithReporter(ctx context.Context, cfg *Config, traceReporter reporter.
 	isInitialized = true
 
 	return state, nil
+}
+
+func (s *State) PidOomd(pid uint32) bool {
+	if s.oomdPids == nil {
+		return false
+	}
+	return s.oomdPids.Contains(pid)
 }
 
 // GetState returns the singleton State instance.
@@ -369,6 +378,8 @@ func (s *State) reportBucketsAsTraces(allBuckets []bpfGobucket, pid uint32, comm
 		fileID = defaultFileID
 	}
 
+	ts := libpf.UnixTime64(time.Now().UnixNano())
+
 	// Convert buckets to traces and report them
 	for _, bucket := range allBuckets {
 		mr := bucket.memRecord()
@@ -395,9 +406,9 @@ func (s *State) reportBucketsAsTraces(allBuckets []bpfGobucket, pid uint32, comm
 		fileIDs := make([]libpf.FileID, 0, stackLen)
 		linenos := make([]libpf.AddressOrLineno, 0, stackLen)
 		frameTypes := make([]libpf.FrameType, 0, stackLen)
-		mappingStarts := make([]libpf.Address, 0, stackLen)
-		mappingEnds := make([]libpf.Address, 0, stackLen)
-		mappingFileOffsets := make([]uint64, 0, stackLen)
+		// mappingStarts := make([]libpf.Address, 0, stackLen)
+		// mappingEnds := make([]libpf.Address, 0, stackLen)
+		// mappingFileOffsets := make([]uint64, 0, stackLen)
 
 		for i := 0; i < stackLen; i++ {
 			addr := bucket.Stk[i]
@@ -409,26 +420,28 @@ func (s *State) reportBucketsAsTraces(allBuckets []bpfGobucket, pid uint32, comm
 			fileIDs = append(fileIDs, fileID)
 			linenos = append(linenos, libpf.AddressOrLineno(addr))
 			frameTypes = append(frameTypes, libpf.NativeFrame)
-			mappingStarts = append(mappingStarts, 0)
-			mappingEnds = append(mappingEnds, ^libpf.Address(0))
-			mappingFileOffsets = append(mappingFileOffsets, 0)
+			// mappingStarts = append(mappingStarts, 0)
+			// mappingEnds = append(mappingEnds, ^libpf.Address(0))
+			// mappingFileOffsets = append(mappingFileOffsets, 0)
 		}
 
 		// Create the trace
 		trace := &libpf.Trace{
-			Files:              fileIDs,
-			Linenos:            linenos,
-			FrameTypes:         frameTypes,
-			MappingStart:       mappingStarts,
-			MappingEnd:         mappingEnds,
-			MappingFileOffsets: mappingFileOffsets,
-			Hash:               libpf.TraceHash{},
+			Files:      fileIDs,
+			Linenos:    linenos,
+			FrameTypes: frameTypes,
+			// MappingStart:       mappingStarts,
+			// MappingEnd:         mappingEnds,
+			// MappingFileOffsets: mappingFileOffsets,
+			CustomLabels: s.labels,
 		}
+
+		trace.Hash = traceutil.HashTrace(trace)
 
 		// Create the trace metadata with allocs and frees
 		// Note: The exact fields available in TraceEventMeta may vary depending on the version
 		meta := &samples.TraceEventMeta{
-			Timestamp:      libpf.UnixTime64(time.Now().UnixNano()),
+			Timestamp:      ts,
 			Comm:           command,
 			ProcessName:    command,
 			ExecutablePath: binaryPath,
@@ -593,17 +606,15 @@ func (s *State) watchPIDSync(pid uint32) error {
 	log.WithField("pid", pid).Debug("Adding new PID to oomprof monitoring")
 
 	// Synchronously add the process
-	s.addProcess(pid)
-
-	return nil
+	return s.addProcess(pid)
 }
 
-func (s *State) addProcess(pid uint32) {
+func (s *State) addProcess(pid uint32) error {
 	// Look up the mbuckets address for this PID
 	mbucketsAddr, err := s.getMBucketsAddrForPID(pid, s.pidToExeInfo)
 	if err != nil {
 		log.WithError(err).WithField("pid", pid).Debug("Failed to get mbuckets address for PID")
-		return
+		return err
 	}
 
 	log.WithFields(log.Fields{
@@ -614,8 +625,10 @@ func (s *State) addProcess(pid uint32) {
 	// Add to eBPF monitoring
 	if err := s.addGoProcess(pid, mbucketsAddr); err != nil {
 		log.WithError(err).WithField("pid", pid).Debug("Failed to add Go process to eBPF monitoring")
+		return err
 	}
 	log.WithField("pid", pid).Debug("Successfully added PID to oomprof monitoring")
+	return nil
 }
 
 // getMBucketsAddrForPID looks up the mbuckets address for a specific PID by reading its ELF file
@@ -682,12 +695,13 @@ func (s *State) getMBucketsAddrForPID(pid uint32, pidToExeInfo *sync.Map) (uint6
 // capturePprofLabels captures current pprof labels and stores them in the state
 func (s *State) capturePprofLabels(ctx context.Context) {
 	// Convert runtime/pprof.LabelSet to map[string][]string
-	var lbls []string
 	pprof.ForLabels(ctx, func(key, value string) bool {
-		lbls = append(lbls, key, value)
+		if s.labels == nil {
+			s.labels = make(map[string]string)
+		}
+		s.labels[key] = value
 		return true
 	})
-	s.labels = pprof.Labels(lbls...)
 }
 
 // ProfilePid profiles a specific PID by setting it in the profile_pid map and sending a signal.
@@ -845,7 +859,7 @@ func (s *State) monitorEventMap(ctx context.Context, state *State, pidToExeInfo 
 			switch ev.EventType {
 			case profileEvent:
 				pid = ev.Payload
-				log.WithField("pid", pid).Infof("Received profile event for PID")
+				log.WithField("pid", pid).Info("Received profile event for PID")
 				// Read pprof data
 
 				var gop bpfGoProc
@@ -853,16 +867,21 @@ func (s *State) monitorEventMap(ctx context.Context, state *State, pidToExeInfo 
 					log.WithError(err).WithField("pid", pid).Error("error getting PID from go_procs map")
 					continue
 				}
-				log.WithFields(log.Fields{"pid": pid, "buckets": gop.NumBuckets}).Debug("Found Go process")
+				log.WithFields(log.Fields{"pid": pid, "buckets": gop.NumBuckets, "complete": gop.Complete}).Info("Got profile event")
 
 				// Retrieve the exe info from the sync.Map
 				var exeInfo *ExeInfo
 				if infoValue, ok := pidToExeInfo.Load(pid); ok {
 					exeInfo = infoValue.(*ExeInfo)
 				} else {
-					log.WithField("pid", pid).Debug("exe info not found for PID")
+					log.WithField("pid", pid).Warn("exe info not found for PID")
 					exeInfo = &ExeInfo{Path: "", BuildID: ""}
 				}
+
+				log.WithFields(log.Fields{
+					"pid":     pid,
+					"exePath": exeInfo.Path,
+					"buildID": exeInfo.BuildID}).Info("Retrieved executable info for PID")
 
 				// Extract command name from exe path
 				command := "unknown"

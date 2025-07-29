@@ -89,9 +89,10 @@ struct gobucket {
 
 struct GoProc {
   u64 mbuckets; // static doesn't change
-  u32 num_buckets;  // updated after each profile is record
+  u32 num_buckets;  // updated after each profile is recorded
   u32 maxStackErrors;
   bool readError;
+  bool complete;
 };
 
 struct Event {
@@ -203,6 +204,7 @@ record_profile_buckets(void *ctx, struct ProfileState *state) {
     }
     // Read the entire bucket structure in one go
     // This reads: header + MAX_STACK_DEPTH stack slots + memRecord
+    // TODO, can we just read the stack and the mem
     u64 total_size = sizeof(struct gobucket_header) +
                      (MAX_STACK_DEPTH * sizeof(u64)) +
                      sizeof(struct memRecord);
@@ -221,6 +223,10 @@ record_profile_buckets(void *ctx, struct ProfileState *state) {
       continue;
     }
     state->bucket_count++;
+  }
+
+  if (state->gobp == 0) {
+    gop->complete = true;
   }
 
   DEBUG_PRINT("found %d gobuckets\n", state->bucket_count);

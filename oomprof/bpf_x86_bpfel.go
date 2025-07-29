@@ -8,25 +8,31 @@ import (
 	_ "embed"
 	"fmt"
 	"io"
+	"structs"
 
 	"github.com/cilium/ebpf"
 )
 
 type bpfEvent struct {
+	_         structs.HostLayout
 	EventType uint32
 	Payload   uint32
 }
 
 type bpfGoProc struct {
+	_              structs.HostLayout
 	Mbuckets       uint64
 	NumBuckets     uint32
 	MaxStackErrors uint32
 	ReadError      bool
-	_              [7]byte
+	Complete       bool
+	_              [6]byte
 }
 
 type bpfGobucket struct {
+	_      structs.HostLayout
 	Header struct {
+		_          structs.HostLayout
 		Next       uint64
 		Allnext    uint64
 		BucketType uint64
@@ -39,13 +45,16 @@ type bpfGobucket struct {
 }
 
 type bpfMemRecord struct {
+	_      structs.HostLayout
 	Active struct {
+		_          structs.HostLayout
 		Allocs     uint64
 		Frees      uint64
 		AllocBytes uint64
 		FreeBytes  uint64
 	}
 	Future [3]struct {
+		_          structs.HostLayout
 		Allocs     uint64
 		Frees      uint64
 		AllocBytes uint64
@@ -54,6 +63,7 @@ type bpfMemRecord struct {
 }
 
 type bpfProfileState struct {
+	_            structs.HostLayout
 	Pid          uint32
 	_            [4]byte
 	Gobp         uint64
