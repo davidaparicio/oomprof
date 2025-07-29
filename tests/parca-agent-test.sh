@@ -1,5 +1,5 @@
 #!/bin/bash
-set -ex
+set -e
 
 # Integration test for OOM profiling with parca-agent and Parca server
 # This script:

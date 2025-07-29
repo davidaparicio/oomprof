@@ -380,6 +380,18 @@ func (s *State) reportBucketsAsTraces(allBuckets []bpfGobucket, pid uint32, comm
 
 	ts := libpf.UnixTime64(time.Now().UnixNano())
 
+	trace := &libpf.Trace{}
+
+	// reuse the TraceEventMeta object, this should probably be declared somewhere.
+	meta := &samples.TraceEventMeta{
+		Timestamp:      ts,
+		Comm:           command,
+		ProcessName:    command,
+		ExecutablePath: binaryPath,
+		PID:            libpf.PID(pid),
+		Origin:         support.TraceOriginMemory, // Custom origin for memory profiling
+	}
+
 	// Convert buckets to traces and report them
 	for _, bucket := range allBuckets {
 		mr := bucket.memRecord()
@@ -425,33 +437,16 @@ func (s *State) reportBucketsAsTraces(allBuckets []bpfGobucket, pid uint32, comm
 			// mappingFileOffsets = append(mappingFileOffsets, 0)
 		}
 
-		// Create the trace
-		trace := &libpf.Trace{
-			Files:      fileIDs,
-			Linenos:    linenos,
-			FrameTypes: frameTypes,
-			// MappingStart:       mappingStarts,
-			// MappingEnd:         mappingEnds,
-			// MappingFileOffsets: mappingFileOffsets,
-			CustomLabels: s.labels,
-		}
-
+		trace.Files = fileIDs
+		trace.Linenos = linenos
+		trace.FrameTypes = frameTypes
+		trace.CustomLabels = s.labels
 		trace.Hash = traceutil.HashTrace(trace)
 
-		// Create the trace metadata with allocs and frees
-		// Note: The exact fields available in TraceEventMeta may vary depending on the version
-		meta := &samples.TraceEventMeta{
-			Timestamp:      ts,
-			Comm:           command,
-			ProcessName:    command,
-			ExecutablePath: binaryPath,
-			PID:            libpf.PID(pid),
-			Origin:         support.TraceOriginMemory, // Custom origin for memory profiling
-			Allocs:         allocs,
-			Frees:          frees,
-			AllocBytes:     allocBytes,
-			FreeBytes:      freeBytes,
-		}
+		meta.Allocs = allocs
+		meta.Frees = frees
+		meta.AllocBytes = allocBytes
+		meta.FreeBytes = freeBytes
 
 		// Report the trace event
 		if err := s.traceReporter.ReportTraceEvent(trace, meta); err != nil {

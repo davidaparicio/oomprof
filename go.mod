@@ -13,7 +13,7 @@ require (
 	go.opentelemetry.io/ebpf-profiler v0.0.0-20250519164423-009a07f3803c
 )
 
-replace go.opentelemetry.io/ebpf-profiler => github.com/parca-dev/opentelemetry-ebpf-profiler v0.0.0-20250723174028-e4e60d5df998
+replace go.opentelemetry.io/ebpf-profiler => github.com/parca-dev/opentelemetry-ebpf-profiler v0.0.0-20250729124725-a01bc7899684
 
 require (
 	github.com/containerd/log v0.1.0 // indirect
@@ -38,7 +38,6 @@ require (
 	go.opentelemetry.io/collector/pdata/pprofile v0.129.0 // indirect
 	go.opentelemetry.io/otel v1.37.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
-	golang.org/x/arch v0.18.0 // indirect
 	golang.org/x/net v0.39.0 // indirect
 	golang.org/x/sys v0.33.0 // indirect
 	golang.org/x/text v0.24.0 // indirect
