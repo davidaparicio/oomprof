@@ -29,6 +29,7 @@ import (
 func main() {
 	// Enable memory profiling for this process
 	runtime.MemProfile(nil, false)
+	runtime.MemProfileRate = 1 // Force profiling every allocation
 
 	// Busy sleep for 5 seconds in 1ms chunks
 	start := time.Now()

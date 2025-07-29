@@ -30,19 +30,24 @@ func (b *bpfGobucket) memRecord() *bpfMemRecord {
 	return (*bpfMemRecord)(unsafe.Pointer(uintptr(unsafe.Pointer(&b.Stk[0])) + uintptr(b.Header.Nstk*8)))
 }
 
-func bucketsToPprof(buckets []bpfGobucket, binaryPath string, buildID string, symbolize bool) (*profile.Profile, error) {
+func bucketsToPprof(buckets []bpfGobucket, binaryPath string, buildID string, symbolize bool, reportAlloc bool) (*profile.Profile, error) {
 	// Create a new pprof profile
 	prof := &profile.Profile{
 		DefaultSampleType: "inuse_space",
 		SampleType: []*profile.ValueType{
-			{Type: "alloc_objects", Unit: "count"},
-			{Type: "alloc_space", Unit: "bytes"},
 			{Type: "inuse_objects", Unit: "count"},
 			{Type: "inuse_space", Unit: "bytes"},
 		},
 		PeriodType: &profile.ValueType{Type: "space", Unit: "bytes"},
 		Period:     512 * 1024, // TODO: read this from process
 		TimeNanos:  time.Now().UnixNano(),
+	}
+
+	if reportAlloc {
+		prof.SampleType = append(prof.SampleType,
+			&profile.ValueType{Type: "alloc_objects", Unit: "count"},
+			&profile.ValueType{Type: "alloc_space", Unit: "bytes"})
+
 	}
 
 	// Create a mapping for the binary if we have the path
@@ -68,11 +73,15 @@ func bucketsToPprof(buckets []bpfGobucket, binaryPath string, buildID string, sy
 	uniqueAddrs := make(map[uint64]bool)
 	for _, bucket := range buckets {
 		mr := bucket.memRecord()
-		allocs := mr.Active.Allocs - mr.Active.Frees
+		allocs := mr.Active.Allocs
+		inuse := mr.Active.Allocs - mr.Active.Frees
 		for i := 0; i < 3; i++ {
-			allocs += mr.Future[i].Allocs - mr.Future[i].Frees
+			allocs += mr.Future[i].Allocs
+			inuse += mr.Future[i].Allocs - mr.Future[i].Frees
 		}
-		if allocs == 0 {
+		// Skip buckets based on ReportAlloc setting
+		if !reportAlloc && inuse == 0 {
+			// When only reporting inuse, skip buckets with zero inuse
 			continue
 		}
 
@@ -102,7 +111,8 @@ func bucketsToPprof(buckets []bpfGobucket, binaryPath string, buildID string, sy
 			inuse += mr.Future[i].Allocs - mr.Future[i].Frees
 			inuseBytes += mr.Future[i].AllocBytes - mr.Future[i].FreeBytes
 		}
-		if allocs == 0 {
+		if !reportAlloc && inuse == 0 {
+			// When only reporting inuse, skip buckets with zero inuse
 			continue
 		}
 
@@ -170,10 +180,13 @@ func bucketsToPprof(buckets []bpfGobucket, binaryPath string, buildID string, sy
 		}
 
 		// Create a sample
-		//log.Println("Adding sample with allocs:", allocs, "bytes:", allocBytes, "locations:", len(locations))
+		values := []int64{int64(inuse), int64(inuseBytes)}
+		if reportAlloc {
+			values = append(values, int64(allocs), int64(allocBytes))
+		}
 		sample := &profile.Sample{
 			Location: locations,
-			Value:    []int64{int64(allocs), int64(allocBytes), int64(inuse), int64(inuseBytes)}, // count, bytes
+			Value:    values,
 		}
 		prof.Sample = append(prof.Sample, sample)
 	}

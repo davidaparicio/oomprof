@@ -25,7 +25,9 @@ type bpfGoProc struct {
 	NumBuckets     uint32
 	MaxStackErrors uint32
 	ReadError      bool
-	_              [7]byte
+	Complete       bool
+	ReportAlloc    bool
+	_              [5]byte
 }
 
 type bpfGobucket struct {

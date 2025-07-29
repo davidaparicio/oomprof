@@ -90,6 +90,8 @@ type ProfileData struct {
 	ReadError bool
 	// OOM indicates if this profile was triggered by an OOM event.
 	OOM bool
+	// Complete indicates the eBPF program walked all buckets
+	Complete bool
 }
 
 const (
@@ -134,6 +136,10 @@ type Config struct {
 	Verbose bool
 	// LogTracePipe enables logging of BPF trace pipe output for debugging.
 	LogTracePipe bool
+	// ReportAlloc enables reporting allocation metrics in addition to inuse metrics.
+	// When false (default), only inuse_objects and inuse_space are reported.
+	// When true, alloc_objects and alloc_space are also included.
+	ReportAlloc bool
 }
 
 // TestSleep is the duration tests should sleep to ensure they are scanned before they OOM.
@@ -400,16 +406,23 @@ func (s *State) reportBucketsAsTraces(allBuckets []bpfGobucket, pid uint32, comm
 		allocBytes := mr.Active.AllocBytes
 		freeBytes := mr.Active.FreeBytes
 
+		// Calculate inuse metrics
+		inuse := mr.Active.Allocs - mr.Active.Frees
+		inuseBytes := mr.Active.AllocBytes - mr.Active.FreeBytes
+
 		// Aggregate future allocations
 		for i := 0; i < 3; i++ {
 			allocs += mr.Future[i].Allocs
 			frees += mr.Future[i].Frees
 			allocBytes += mr.Future[i].AllocBytes
 			freeBytes += mr.Future[i].FreeBytes
+			inuse += mr.Future[i].Allocs - mr.Future[i].Frees
+			inuseBytes += mr.Future[i].AllocBytes - mr.Future[i].FreeBytes
 		}
 
-		// Skip empty buckets
-		if allocs == 0 {
+		// Skip buckets based on ReportAlloc setting
+		if !s.config.ReportAlloc && inuse == 0 {
+			// When only reporting inuse, skip buckets with zero inuse
 			continue
 		}
 
@@ -443,6 +456,7 @@ func (s *State) reportBucketsAsTraces(allBuckets []bpfGobucket, pid uint32, comm
 		trace.CustomLabels = s.labels
 		trace.Hash = traceutil.HashTrace(trace)
 
+		// Always report accurate Allocs/Frees - let downstream do the inuse calculation
 		meta.Allocs = allocs
 		meta.Frees = frees
 		meta.AllocBytes = allocBytes
@@ -546,7 +560,8 @@ func loadBPF() (*bpfObjects, link.Link, link.Link, error) {
 func (s *State) addGoProcess(pid uint32, mbucketsAddr uint64) error {
 	// update go_procs map
 	goProc := bpfGoProc{
-		Mbuckets: mbucketsAddr,
+		Mbuckets:    mbucketsAddr,
+		ReportAlloc: s.config.ReportAlloc,
 	}
 	if err := s.maps.GoProcs.Put(pid, &goProc); err != nil {
 		log.WithError(err).WithField("pid", pid).Error("error putting PID into go_procs map")
@@ -715,8 +730,9 @@ func (s *State) ProfilePid(ctx context.Context, pid uint32) error {
 		return fmt.Errorf("PID %d not found in go_procs map: %w", pid, err)
 	}
 
-	// Reset num_buckets to 0 to allow re-profiling
+	// Reset num_buckets to 0 to allow re-profiling and update ReportAlloc
 	gop.NumBuckets = 0
+	gop.ReportAlloc = s.config.ReportAlloc
 	if err := s.maps.GoProcs.Put(pid, &gop); err != nil {
 		return fmt.Errorf("failed to reset num_buckets for PID %d: %w", pid, err)
 	}
@@ -801,10 +817,10 @@ func processBuckets(maps *bpfMaps, numBuckets uint32) ([]bpfGobucket, error) {
 	return allBuckets, nil
 }
 
-func readProfile(allBuckets []bpfGobucket, binaryPath string, buildID string, symbolize bool) (*profile.Profile, error) {
+func readProfile(allBuckets []bpfGobucket, binaryPath string, buildID string, symbolize bool, reportAlloc bool) (*profile.Profile, error) {
 	// Convert to pprof format
 	convertStart := time.Now()
-	prof, err := bucketsToPprof(allBuckets, binaryPath, buildID, symbolize)
+	prof, err := bucketsToPprof(allBuckets, binaryPath, buildID, symbolize, reportAlloc)
 	if err != nil {
 		return nil, fmt.Errorf("failed to convert buckets to pprof: %v", err)
 	}
@@ -899,7 +915,7 @@ func (s *State) monitorEventMap(ctx context.Context, state *State, pidToExeInfo 
 				// Handle either ProfileData channel or TraceReporter
 				if state.profileChan != nil {
 					// Original pprof mode
-					prof, err := readProfile(allBuckets, exeInfo.Path, exeInfo.BuildID, s.config.Symbolize)
+					prof, err := readProfile(allBuckets, exeInfo.Path, exeInfo.BuildID, s.config.Symbolize, s.config.ReportAlloc)
 					if err != nil {
 						log.WithError(err).WithField("pid", pid).Error("error reading profile for PID")
 					} else {
@@ -914,6 +930,7 @@ func (s *State) monitorEventMap(ctx context.Context, state *State, pidToExeInfo 
 							Profile:        prof,
 							ReadError:      gop.ReadError,
 							MaxStackErrors: gop.MaxStackErrors,
+							Complete:       gop.Complete,
 						}:
 							log.WithFields(log.Fields{
 								"pid":           pid,

@@ -12,11 +12,13 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestOOMProfileChannelMode tests OOM profiling using the channel-based Setup call
-func TestOOMProfileChannelMode(t *testing.T) {
+func init() {
 	// Set memory profile rate to 1 for maximum profile buckets
 	runtime.MemProfileRate = 1
+}
 
+// TestOOMProfileChannelMode tests OOM profiling using the channel-based Setup call
+func TestOOMProfileChannelMode(t *testing.T) {
 	// Skip if not root (required for eBPF)
 	if os.Getuid() != 0 {
 		t.Skip("Test requires root privileges")
@@ -77,6 +79,7 @@ func TestOOMProfileChannelMode(t *testing.T) {
 		t.Log("Profile successfully received")
 		require.Equal(t, selfPID, profileData.PID, "Profile should be for our PID")
 		require.NotNil(t, profileData.Profile, "Profile should not be nil")
+		require.True(t, len(profileData.Profile.Sample) > 0 || !profileData.Complete)
 		if len(profileData.Profile.Sample) == 0 {
 			t.Log("Warning: Profile has no samples (may be due to symbolization issues)")
 		} else {
@@ -103,11 +106,13 @@ func TestOOMProfileChannelMode(t *testing.T) {
 		t.Log("Second profile successfully received")
 		require.Equal(t, selfPID, profileData.PID, "Second profile should be for our PID")
 		require.NotNil(t, profileData.Profile, "Second profile should not be nil")
+		require.True(t, len(profileData.Profile.Sample) > 0 || !profileData.Complete)
 		if len(profileData.Profile.Sample) == 0 {
 			t.Log("Warning: Second profile has no samples")
 		} else {
 			t.Logf("Second profile has %d samples", len(profileData.Profile.Sample))
 		}
+		require.Equal(t, len(profileData.Profile.SampleType), 2)
 	case <-time.After(10 * time.Second):
 		t.Log("Second profile not received - completing test")
 		return // Complete the test successfully

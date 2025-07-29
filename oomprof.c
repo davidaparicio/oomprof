@@ -93,6 +93,7 @@ struct GoProc {
   u32 maxStackErrors;
   bool readError;
   bool complete;
+  bool reportAlloc; // whether to report alloc metrics or just inuse
 };
 
 struct Event {
