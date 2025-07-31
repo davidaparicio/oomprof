@@ -485,7 +485,9 @@ func loadBPF() (*bpfObjects, link.Link, link.Link, error) {
 	// Only enable verbose logging if we're in debug mode
 	if log.GetLevel() == log.DebugLevel {
 		progOpts.LogLevel = ebpf.LogLevelBranch | ebpf.LogLevelInstruction | ebpf.LogLevelStats
-		progOpts.LogSizeStart = 50 * 1024 * 1024 // Increased to 50MB
+		progOpts.LogSizeStart = 1024 * 1024
+	} else {
+		progOpts.LogDisabled = true
 	}
 
 	opts := ebpf.CollectionOptions{

@@ -13,9 +13,8 @@ OOMPROF_ROOT="$(dirname "$SCRIPT_DIR")"
 PARCA_AGENT_DIR="${PARCA_AGENT_DIR:-../parca-agent}"
 
 # Configuration
-PARCA_GRPC_PORT="${PARCA_GRPC_PORT:-7070}"
-PARCA_HTTP_PORT="${PARCA_HTTP_PORT:-7070}"
-PARCA_CONTAINER_NAME="oomprof-test-parca"
+PARCA_PORT="${PARCA_PORT:-7070}"
+PARCA_CONTAINER_NAME="parca"
 AGENT_CONTAINER_NAME="oomprof-test-agent"
 TEST_TIMEOUT="${TEST_TIMEOUT:-300}" # 5 minutes
 # default to false once we merge to main
@@ -109,24 +108,24 @@ wait_for_service() {
 
 check_existing_parca() {
     # Check if port is already in use
-    if lsof -i :"$PARCA_GRPC_PORT" >/dev/null 2>&1; then
-        log "Port $PARCA_GRPC_PORT is already in use"
+    if lsof -i :"$PARCA_PORT" >/dev/null 2>&1; then
+        log "Port $PARCA_PORT is already in use"
 
         # Check if it's a Parca container
-        if docker ps | grep -q "parca.*$PARCA_GRPC_PORT"; then
-            local existing_container=$(docker ps | grep "parca.*$PARCA_GRPC_PORT" | awk '{print $NF}')
+        if docker ps | grep -q "parca.*$PARCA_PORT"; then
+            local existing_container=$(docker ps | grep "parca.*$PARCA_PORT" | awk '{print $NF}')
             warn "Found existing Parca server container: $existing_container"
 
             if [ "$USE_EXISTING_PARCA" = "true" ]; then
                 log "Using existing Parca server (USE_EXISTING_PARCA=true)"
                 return 0
             else
-                error "Port $PARCA_GRPC_PORT is already in use by Parca server"
+                error "Port $PARCA_PORT is already in use by Parca server"
                 error "Either stop the existing server or set USE_EXISTING_PARCA=true"
                 exit 1
             fi
         else
-            error "Port $PARCA_GRPC_PORT is already in use by another process"
+            error "Port $PARCA_PORT is already in use by another process"
             exit 1
         fi
     fi
@@ -149,17 +148,17 @@ start_parca_server() {
     docker run -d \
         --name "$PARCA_CONTAINER_NAME" \
         --privileged \
-        -p "$PARCA_GRPC_PORT:7070" \
+        -p "$PARCA_PORT:7070" \
         ghcr.io/parca-dev/parca:v0.24.0 \
         /parca \
         --log-level=debug
 
     # Wait for Parca to be ready
-    wait_for_service "Parca server" "localhost" "$PARCA_GRPC_PORT" 60
+    wait_for_service "Parca server" "localhost" "$PARCA_PORT" 60
 
     # Verify gRPC endpoint
     log "Verifying Parca gRPC endpoint..."
-    if ! timeout 10 bash -c "echo > /dev/tcp/localhost/$PARCA_GRPC_PORT" 2>/dev/null; then
+    if ! timeout 10 bash -c "echo > /dev/tcp/localhost/$PARCA_PORT" 2>/dev/null; then
         error "Parca gRPC endpoint not accessible"
         exit 1
     fi
@@ -206,7 +205,7 @@ start_local_agent() {
     log "Starting parca-agent with OOM profiling..."
     sudo ./parca-agent \
         --node="test-node" \
-        --remote-store-address="localhost:$PARCA_GRPC_PORT" \
+        --remote-store-address="localhost:$PARCA_PORT" \
         --remote-store-insecure \
         --enable-oom-prof \
         2>&1 | tee -i "/tmp/parca-agent.log" &
@@ -248,7 +247,7 @@ start_docker_agent() {
         -v /etc/machine-id:/etc/machine-id:ro \
         ghcr.io/parca-dev/parca-agent:v0.39.3 \
         --node="test-node" \
-        --remote-store-address="localhost:$PARCA_GRPC_PORT" \
+        --remote-store-address="localhost:$PARCA_PORT" \
         --remote-store-insecure \
         --enable-oom-prof
 
@@ -310,7 +309,7 @@ query_parca_profiles() {
     local response
     response=$(grpcurl -plaintext \
         -d "{\"query\": \"$query\", \"start\": \"$start_time\", \"end\": \"$end_time\"}" \
-        localhost:$PARCA_GRPC_PORT \
+        localhost:$PARCA_PORT \
         parca.query.v1alpha1.QueryService/QueryRange 2>/dev/null || echo "{}")
 
     echo "$response"
@@ -343,7 +342,7 @@ validate_oom_profiles() {
 
     log "Profile query results:"
     log "  - Total memory profiles found: $total_count"
-    
+
     # Show what profiles we found
     if [ "$total_count" -gt 0 ]; then
         log "Found memory profiles from processes:"
@@ -384,7 +383,7 @@ validate_oom_profiles() {
             error "Expected at least 2 memory profiles, but found:"
             error "  - Total memory profiles: $total_count"
             error "  - Profile write operations: $profile_writes"
-            
+
             # Show sample response for debugging
             log "Sample query response:"
             echo "$all_memory_response" | head -20
@@ -465,7 +464,7 @@ if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
     echo "  - Root privileges (for eBPF)"
     echo "  - Docker and Docker daemon running"
     echo "  - Internet connection (to pull Docker images)"
-    echo "  - Available ports $PARCA_HTTP_PORT and $PARCA_GRPC_PORT"
+    echo "  - Available ports $PARCA_PORT"
     exit 0
 fi
 
