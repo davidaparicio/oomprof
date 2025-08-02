@@ -21,6 +21,8 @@ TEST_TIMEOUT="${TEST_TIMEOUT:-300}" # 5 minutes
 USE_LOCAL_AGENT="${USE_LOCAL_AGENT:-true}"
 USE_EXISTING_PARCA="${USE_EXISTING_PARCA:-false}"
 DRY_RUN="${DRY_RUN:-false}"
+PARCA_AGENT_REV="${PARCA_AGENT_REV:-v0.39.3}" # Default to a specific version
+PARALLEL_TESTS=1 # Default to sequential execution
 
 # Colors for output
 RED='\033[0;31m'
@@ -208,6 +210,7 @@ start_local_agent() {
         --remote-store-address="localhost:$PARCA_PORT" \
         --remote-store-insecure \
         --enable-oom-prof \
+        --config-path="$SCRIPT_DIR/parca-agent.yml" \
         2>&1 | tee -i "/tmp/parca-agent.log" &
 
     local agent_pid=$!
@@ -245,11 +248,13 @@ start_docker_agent() {
         -v /lib/modules:/lib/modules:ro \
         -v /usr/src:/usr/src:ro \
         -v /etc/machine-id:/etc/machine-id:ro \
-        ghcr.io/parca-dev/parca-agent:v0.39.3 \
+        -v "$SCRIPT_DIR/parca-agent.yml:/parca-agent.yml:ro" \
+        ghcr.io/parca-dev/parca-agent:$PARCA_AGENT_REV \
         --node="test-node" \
         --remote-store-address="localhost:$PARCA_PORT" \
         --remote-store-insecure \
-        --enable-oom-prof
+        --enable-oom-prof \
+        --config-path="/parca-agent.yml"
 
     # Give agent time to start
     sleep 10
@@ -279,23 +284,91 @@ run_memory_tests() {
     # Make sure it's executable
     chmod +x "./run-all-memlimited.sh"
 
-    log "Executing memory-limited tests that should trigger OOM events..."
-
-    # Run the tests with a timeout
-    if timeout $TEST_TIMEOUT ./run-all-memlimited.sh; then
-        success "Memory tests completed successfully"
+    if [ "$PARALLEL_TESTS" -gt 1 ]; then
+        log "Executing $PARALLEL_TESTS memory-limited tests in parallel..."
+        run_parallel_memory_tests
     else
-        local exit_code=$?
-        if [ $exit_code -eq 124 ]; then
-            warn "Memory tests timed out after $TEST_TIMEOUT seconds"
+        log "Executing memory-limited tests that should trigger OOM events..."
+
+        # Run the tests with a timeout
+        if timeout $TEST_TIMEOUT ./run-all-memlimited.sh; then
+            success "Memory tests completed successfully"
         else
-            warn "Memory tests exited with code $exit_code (may be expected for OOM tests)"
+            local exit_code=$?
+            if [ $exit_code -eq 124 ]; then
+                warn "Memory tests timed out after $TEST_TIMEOUT seconds"
+            else
+                warn "Memory tests exited with code $exit_code (may be expected for OOM tests)"
+            fi
         fi
     fi
 
     # Give time for profiles to be processed
     log "Waiting for profiles to be processed and sent to Parca..."
     sleep 10
+}
+
+run_parallel_memory_tests() {
+    local pids=()
+    local failed=0
+    
+    # Create a temporary directory for parallel test logs
+    local parallel_log_dir="/tmp/parca-parallel-tests-$$"
+    mkdir -p "$parallel_log_dir"
+    
+    log "Starting $PARALLEL_TESTS parallel test instances..."
+    
+    for i in $(seq 1 "$PARALLEL_TESTS"); do
+        log "Starting test instance $i..."
+        
+        # Run each test instance in background with unique log
+        (
+            # Each instance gets its own cgroup to avoid conflicts
+            export CGROUP_NAME="oomprof-test-$$-$i"
+            timeout $TEST_TIMEOUT ./run-all-memlimited.sh > "$parallel_log_dir/test-$i.log" 2>&1
+            echo $? > "$parallel_log_dir/test-$i.exitcode"
+        ) &
+        
+        pids+=($!)
+        
+        # Small delay between starts to avoid race conditions
+        sleep 0.5
+    done
+    
+    log "Waiting for all test instances to complete..."
+    
+    # Wait for all background processes
+    for i in "${!pids[@]}"; do
+        local pid=${pids[$i]}
+        local instance=$((i + 1))
+        
+        wait $pid
+        local exit_code=$(cat "$parallel_log_dir/test-$instance.exitcode" 2>/dev/null || echo "255")
+        
+        if [ $exit_code -eq 0 ]; then
+            success "Test instance $instance completed successfully"
+        elif [ $exit_code -eq 124 ]; then
+            warn "Test instance $instance timed out after $TEST_TIMEOUT seconds"
+            ((failed++))
+        else
+            warn "Test instance $instance exited with code $exit_code (may be expected for OOM tests)"
+        fi
+        
+        # Show last few lines of log for debugging
+        if [ -f "$parallel_log_dir/test-$instance.log" ]; then
+            log "Last 5 lines from test instance $instance:"
+            tail -5 "$parallel_log_dir/test-$instance.log" | sed 's/^/  /'
+        fi
+    done
+    
+    # Cleanup
+    rm -rf "$parallel_log_dir"
+    
+    if [ $failed -gt 0 ]; then
+        warn "$failed test instances had issues, but this may be expected for OOM tests"
+    else
+        success "All $PARALLEL_TESTS test instances completed"
+    fi
 }
 
 query_parca_profiles() {
@@ -368,19 +441,20 @@ validate_oom_profiles() {
     local profile_writes=$(docker logs "$PARCA_CONTAINER_NAME" 2>&1 | grep -c "grpc.service=parca.profilestore.v1alpha1.ProfileStoreService grpc.method=WriteRaw" || echo "0")
     log "Found $profile_writes profile write operations in Parca logs"
 
-    # Validate results - we just need 2 or more memory profiles to declare success
+    # Validate results - we need at least 2 profiles per parallel test instance
     local validation_passed=false
+    local expected_min_profiles=$((2 * PARALLEL_TESTS))
 
-    if [ "$total_count" -ge 2 ]; then
+    if [ "$total_count" -ge "$expected_min_profiles" ]; then
         success "Found $total_count memory profiles! OOM profiling integration test PASSED!"
         validation_passed=true
     else
         # Fallback to checking Parca logs for profile activity
-        if [ "$profile_writes" -ge 2 ]; then
+        if [ "$profile_writes" -ge "$expected_min_profiles" ]; then
             success "Found $profile_writes profile write operations in Parca logs! OOM profiling integration test PASSED!"
             validation_passed=true
         else
-            error "Expected at least 2 memory profiles, but found:"
+            error "Expected at least $expected_min_profiles memory profiles (2 per test instance x $PARALLEL_TESTS instances), but found:"
             error "  - Total memory profiles: $total_count"
             error "  - Profile write operations: $profile_writes"
 
@@ -390,7 +464,11 @@ validate_oom_profiles() {
         fi
     fi
 
-    return $([ "$validation_passed" = true ] && echo 0 || echo 1)
+    if [ "$validation_passed" = true ]; then
+        return 0
+    else
+        return 1
+    fi
 }
 
 main() {
@@ -401,6 +479,7 @@ main() {
     log "  - Use local agent: $USE_LOCAL_AGENT"
     log "  - Parca agent dir: $PARCA_AGENT_DIR"
     log "  - Test timeout: $TEST_TIMEOUT seconds"
+    log "  - Parallel tests: $PARALLEL_TESTS"
     log "  - Dry run: $DRY_RUN"
 
     if [ "$DRY_RUN" = "true" ]; then
@@ -437,36 +516,60 @@ main() {
     fi
 }
 
-# Help message
-if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
-    echo "OOM Profiling Integration Test"
-    echo ""
-    echo "This script tests the full integration between oomprof, parca-agent, and Parca server."
-    echo ""
-    echo "Usage: $0 [options]"
-    echo ""
-    echo "Environment Variables:"
-    echo "  USE_LOCAL_AGENT=true          Use local parca-agent build instead of Docker"
-    echo "  PARCA_AGENT_DIR=/path         Path to parca-agent source directory (default: ../parca-agent)"
-    echo "  PARCA_HTTP_PORT=7071          Parca HTTP port (default: 7071)"
-    echo "  PARCA_GRPC_PORT=7070          Parca gRPC port (default: 7070)"
-    echo "  TEST_TIMEOUT=300              Test timeout in seconds (default: 300)"
-    echo "  DRY_RUN=true                  Show what would be done without executing"
-    echo ""
-    echo "Examples:"
-    echo "  # Run with Docker agent:"
-    echo "  sudo $0"
-    echo ""
-    echo "  # Run with local agent build:"
-    echo "  sudo USE_LOCAL_AGENT=true PARCA_AGENT_DIR=/path/to/parca-agent $0"
-    echo ""
-    echo "Requirements:"
-    echo "  - Root privileges (for eBPF)"
-    echo "  - Docker and Docker daemon running"
-    echo "  - Internet connection (to pull Docker images)"
-    echo "  - Available ports $PARCA_PORT"
-    exit 0
-fi
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -n|--parallel)
+            PARALLEL_TESTS="$2"
+            if ! [[ "$PARALLEL_TESTS" =~ ^[0-9]+$ ]] || [ "$PARALLEL_TESTS" -lt 1 ]; then
+                error "Invalid value for -n/--parallel: must be a positive integer"
+                exit 1
+            fi
+            shift 2
+            ;;
+        -h|--help)
+            echo "OOM Profiling Integration Test"
+            echo ""
+            echo "This script tests the full integration between oomprof, parca-agent, and Parca server."
+            echo ""
+            echo "Usage: $0 [options]"
+            echo ""
+            echo "Options:"
+            echo "  -n, --parallel <NUMBER>       Run NUMBER of memory tests in parallel (default: 1)"
+            echo "  -h, --help                    Show this help message"
+            echo ""
+            echo "Environment Variables:"
+            echo "  USE_LOCAL_AGENT=true          Use local parca-agent build instead of Docker"
+            echo "  PARCA_AGENT_DIR=/path         Path to parca-agent source directory (default: ../parca-agent)"
+            echo "  PARCA_HTTP_PORT=7071          Parca HTTP port (default: 7071)"
+            echo "  PARCA_GRPC_PORT=7070          Parca gRPC port (default: 7070)"
+            echo "  TEST_TIMEOUT=300              Test timeout in seconds (default: 300)"
+            echo "  DRY_RUN=true                  Show what would be done without executing"
+            echo ""
+            echo "Examples:"
+            echo "  # Run with Docker agent:"
+            echo "  sudo $0"
+            echo ""
+            echo "  # Run with local agent build:"
+            echo "  sudo USE_LOCAL_AGENT=true PARCA_AGENT_DIR=/path/to/parca-agent $0"
+            echo ""
+            echo "  # Run 4 memory tests in parallel:"
+            echo "  sudo $0 -n 4"
+            echo ""
+            echo "Requirements:"
+            echo "  - Root privileges (for eBPF)"
+            echo "  - Docker and Docker daemon running"
+            echo "  - Internet connection (to pull Docker images)"
+            echo "  - Available ports $PARCA_PORT"
+            exit 0
+            ;;
+        *)
+            error "Unknown option: $1"
+            echo "Use -h or --help for usage information"
+            exit 1
+            ;;
+    esac
+done
 
 # Run main function
 main "$@"

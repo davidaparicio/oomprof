@@ -716,6 +716,31 @@ func (s *State) capturePprofLabels(ctx context.Context) {
 	})
 }
 
+// UnwatchPid removes a PID from all tracking maps and stops monitoring it.
+// This includes removing it from the eBPF go_procs map, pidToExeInfo map,
+// seenPIDs cache, and oomdPids cache (if present).
+func (s *State) UnwatchPid(pid uint32) {
+	log.WithField("pid", pid).Debug("Removing PID from oomprof monitoring")
+
+	// Remove from eBPF go_procs map
+	if err := s.maps.GoProcs.Delete(pid); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+		log.WithError(err).WithField("pid", pid).Warn("Failed to delete PID from go_procs map")
+	}
+
+	// Remove from pidToExeInfo sync.Map
+	s.pidToExeInfo.Delete(pid)
+
+	// Remove from seenPIDs LRU cache
+	s.seenPIDs.Remove(pid)
+
+	// Remove from oomdPids cache if it exists
+	if s.oomdPids != nil {
+		s.oomdPids.Remove(pid)
+	}
+
+	log.WithField("pid", pid).Info("Successfully removed PID from oomprof monitoring")
+}
+
 // ProfilePid profiles a specific PID by setting it in the profile_pid map and sending a signal.
 // This triggers an immediate memory profile collection for the specified process.
 // The process must already be monitored (via WatchPid or automatic scanning).

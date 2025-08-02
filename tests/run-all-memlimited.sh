@@ -7,7 +7,8 @@ set -e
 
 # Memory limit in bytes (0.5GB = 512MB)
 MEMORY_LIMIT=$((100 * 1024 * 1024))
-CGROUP_NAME="oomprof-test-$$"
+# Use environment variable if set (for parallel execution), otherwise use default
+CGROUP_NAME="${CGROUP_NAME:-oomprof-test-$$}"
 CGROUP_PATH="/sys/fs/cgroup/${CGROUP_NAME}"
 
 # Colors for output
