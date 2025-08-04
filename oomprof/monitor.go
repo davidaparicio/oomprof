@@ -728,13 +728,13 @@ func (s *State) UnwatchPid(pid uint32) {
 	if err := s.maps.ProfilePid.Lookup(key, &currentProfilePid); err == nil && currentProfilePid == int32(pid) {
 		// This PID is currently being profiled, delay cleanup to allow perf_event processing
 		log.WithField("pid", pid).Debug("PID is currently being profiled, delaying cleanup")
-		
+
 		// Fork a background goroutine to handle delayed cleanup
 		go func() {
 			// Wait for profile_pid to be cleared or changed by the normal processing flow
 			for i := 0; i < 10; i++ { // Try for up to 5 seconds (10 * 500ms)
 				time.Sleep(500 * time.Millisecond)
-				
+
 				var delayedProfilePid int32
 				if err := s.maps.ProfilePid.Lookup(key, &delayedProfilePid); err != nil || delayedProfilePid != int32(pid) {
 					// profile_pid has been cleared or changed to a different PID
@@ -743,7 +743,7 @@ func (s *State) UnwatchPid(pid uint32) {
 					return
 				}
 			}
-			
+
 			// Timeout after 5 seconds, proceed with cleanup anyway
 			log.WithField("pid", pid).Warn("Timeout waiting for profile_pid to clear, proceeding with cleanup")
 			s.performPidCleanup(pid)
@@ -773,7 +773,7 @@ func (s *State) performPidCleanup(pid uint32) {
 		s.oomdPids.Remove(pid)
 	}
 
-	log.WithField("pid", pid).Info("Successfully removed PID from oomprof monitoring")
+	log.WithField("pid", pid).Debug("Successfully removed PID from oomprof monitoring")
 }
 
 // ProfilePid profiles a specific PID by setting it in the profile_pid map and sending a signal.
