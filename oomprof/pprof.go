@@ -19,16 +19,10 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unsafe"
 
 	"github.com/google/pprof/profile"
 	log "github.com/sirupsen/logrus"
 )
-
-func (b *bpfGobucket) memRecord() *bpfMemRecord {
-	//get a pointer to end of the stk elements
-	return (*bpfMemRecord)(unsafe.Pointer(uintptr(unsafe.Pointer(&b.Stk[0])) + uintptr(b.Header.Nstk*8)))
-}
 
 func bucketsToPprof(buckets []bpfGobucket, binaryPath string, buildID string, symbolize bool, reportAlloc bool) (*profile.Profile, error) {
 	// Create a new pprof profile
@@ -72,7 +66,7 @@ func bucketsToPprof(buckets []bpfGobucket, binaryPath string, buildID string, sy
 	// Collect all unique addresses first
 	uniqueAddrs := make(map[uint64]bool)
 	for _, bucket := range buckets {
-		mr := bucket.memRecord()
+		mr := bucket.Mem
 		allocs := mr.Active.Allocs
 		inuse := mr.Active.Allocs - mr.Active.Frees
 		for i := 0; i < 3; i++ {
@@ -102,7 +96,7 @@ func bucketsToPprof(buckets []bpfGobucket, binaryPath string, buildID string, sy
 
 	// Process each bucket
 	for b, _ := range buckets {
-		mr := buckets[b].memRecord()
+		mr := buckets[b].Mem
 		allocs, allocBytes := mr.Active.Allocs, mr.Active.AllocBytes
 		inuse, inuseBytes := mr.Active.Allocs-mr.Active.Frees, mr.Active.AllocBytes-mr.Active.FreeBytes
 		for i := 0; i < 3; i++ {

@@ -400,7 +400,7 @@ func (s *State) reportBucketsAsTraces(allBuckets []bpfGobucket, pid uint32, comm
 
 	// Convert buckets to traces and report them
 	for _, bucket := range allBuckets {
-		mr := bucket.memRecord()
+		mr := bucket.Mem
 		allocs := mr.Active.Allocs
 		frees := mr.Active.Frees
 		allocBytes := mr.Active.AllocBytes
@@ -940,7 +940,7 @@ func (s *State) monitorEventMap(ctx context.Context, state *State, pidToExeInfo 
 					log.WithError(err).WithField("pid", pid).Error("error getting PID from go_procs map")
 					continue
 				}
-				log.WithFields(log.Fields{"pid": pid, "buckets": gop.NumBuckets, "complete": gop.Complete}).Info("Got profile event")
+				log.WithFields(log.Fields{"pid": pid, "buckets": gop.NumBuckets, "complete": gop.Complete, "read_error": gop.ReadError}).Info("Got profile event")
 
 				// Retrieve the exe info from the sync.Map
 				var exeInfo *ExeInfo

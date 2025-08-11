@@ -15,17 +15,22 @@ package main
 
 import (
 	"fmt"
+	"log"
+	"net/http"
+	"net/http/pprof"
 	"os"
 	"runtime"
 	"time"
 )
+
+const allocSize = 4096
 
 // Global variable to prevent compiler optimization
 var keepAlive [][]byte
 
 // Track which functions have been called in the current call path to avoid recursion
 type callStack struct {
-	called [7]bool
+	called [8]bool
 }
 
 func (cs *callStack) canCall(funcNum int) bool {
@@ -39,8 +44,7 @@ func (cs *callStack) markCalled(funcNum int) callStack {
 }
 
 func func0(cs callStack) {
-	// Allocate 1KB of memory
-	data := make([]byte, 1024)
+	data := make([]byte, allocSize)
 	keepAlive = append(keepAlive, data)
 
 	newCS := cs.markCalled(0)
@@ -64,11 +68,13 @@ func func0(cs callStack) {
 	if newCS.canCall(6) {
 		func6(newCS)
 	}
+	if newCS.canCall(7) {
+		func7(newCS)
+	}
 }
 
 func func1(cs callStack) {
-	// Allocate 1KB of memory
-	data := make([]byte, 1024)
+	data := make([]byte, allocSize)
 	keepAlive = append(keepAlive, data)
 
 	newCS := cs.markCalled(1)
@@ -92,11 +98,13 @@ func func1(cs callStack) {
 	if newCS.canCall(6) {
 		func6(newCS)
 	}
+	if newCS.canCall(7) {
+		func7(newCS)
+	}
 }
 
 func func2(cs callStack) {
-	// Allocate 1KB of memory
-	data := make([]byte, 1024)
+	data := make([]byte, allocSize)
 	keepAlive = append(keepAlive, data)
 
 	newCS := cs.markCalled(2)
@@ -120,11 +128,13 @@ func func2(cs callStack) {
 	if newCS.canCall(6) {
 		func6(newCS)
 	}
+	if newCS.canCall(7) {
+		func7(newCS)
+	}
 }
 
 func func3(cs callStack) {
-	// Allocate 1KB of memory
-	data := make([]byte, 1024)
+	data := make([]byte, allocSize)
 	keepAlive = append(keepAlive, data)
 
 	newCS := cs.markCalled(3)
@@ -148,11 +158,13 @@ func func3(cs callStack) {
 	if newCS.canCall(6) {
 		func6(newCS)
 	}
+	if newCS.canCall(7) {
+		func7(newCS)
+	}
 }
 
 func func4(cs callStack) {
-	// Allocate 1KB of memory
-	data := make([]byte, 1024)
+	data := make([]byte, allocSize)
 	keepAlive = append(keepAlive, data)
 
 	newCS := cs.markCalled(4)
@@ -176,11 +188,14 @@ func func4(cs callStack) {
 	if newCS.canCall(6) {
 		func6(newCS)
 	}
+	if newCS.canCall(7) {
+		func7(newCS)
+	}
 }
 
 func func5(cs callStack) {
 	// Allocate 1KB of memory
-	data := make([]byte, 1024)
+	data := make([]byte, allocSize)
 	keepAlive = append(keepAlive, data)
 
 	newCS := cs.markCalled(5)
@@ -204,11 +219,14 @@ func func5(cs callStack) {
 	if newCS.canCall(6) {
 		func6(newCS)
 	}
+	if newCS.canCall(7) {
+		func7(newCS)
+	}
 }
 
 func func6(cs callStack) {
 	// Allocate 1KB of memory
-	data := make([]byte, 1024)
+	data := make([]byte, allocSize)
 	keepAlive = append(keepAlive, data)
 
 	newCS := cs.markCalled(6)
@@ -232,6 +250,40 @@ func func6(cs callStack) {
 	if newCS.canCall(5) {
 		func5(newCS)
 	}
+	if newCS.canCall(7) {
+		func7(newCS)
+	}
+}
+
+func func7(cs callStack) {
+	// Allocate 1KB of memory
+	data := make([]byte, allocSize)
+	keepAlive = append(keepAlive, data)
+
+	newCS := cs.markCalled(6)
+
+	// Call all other functions that haven't been called yet
+	if newCS.canCall(0) {
+		func0(newCS)
+	}
+	if newCS.canCall(1) {
+		func1(newCS)
+	}
+	if newCS.canCall(2) {
+		func2(newCS)
+	}
+	if newCS.canCall(3) {
+		func3(newCS)
+	}
+	if newCS.canCall(4) {
+		func4(newCS)
+	}
+	if newCS.canCall(5) {
+		func5(newCS)
+	}
+	if newCS.canCall(6) {
+		func6(newCS)
+	}
 }
 
 func main() {
@@ -253,8 +305,18 @@ func main() {
 	func5(cs)
 	func6(cs)
 
-	fmt.Printf("Allocated %d chunks of 1KB each\n", len(keepAlive))
-	fmt.Printf("Total memory allocated: %d KB\n", len(keepAlive))
+	bind := ":8888"
+	log.Println("Starting HTTP server on", bind)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	go func() { log.Fatal(http.ListenAndServe(bind, mux)) }()
+
+	fmt.Printf("Allocated %d chunks\n", len(keepAlive))
+	fmt.Printf("Total memory allocated: %d bytes\n", len(keepAlive)*allocSize)
 
 	// Keep the program running so we can profile it
 	fmt.Printf("Program running, use 'sudo ./oompa -p %d' to profile\n", os.Getpid())

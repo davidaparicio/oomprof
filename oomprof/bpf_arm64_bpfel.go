@@ -41,8 +41,8 @@ type bpfGobucket struct {
 		Size       uint64
 		Nstk       uint64
 	}
-	Stk          [128]uint64
-	WrongDontUse bpfMemRecord
+	Stk [64]uint64
+	Mem bpfMemRecord
 }
 
 type bpfMemRecord struct {

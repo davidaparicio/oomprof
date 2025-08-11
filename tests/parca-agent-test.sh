@@ -17,8 +17,7 @@ PARCA_PORT="${PARCA_PORT:-7070}"
 PARCA_CONTAINER_NAME="parca"
 AGENT_CONTAINER_NAME="oomprof-test-agent"
 TEST_TIMEOUT="${TEST_TIMEOUT:-300}" # 5 minutes
-# default to false once we merge to main
-USE_LOCAL_AGENT="${USE_LOCAL_AGENT:-true}"
+USE_LOCAL_AGENT="${USE_LOCAL_AGENT:-false}"
 USE_EXISTING_PARCA="${USE_EXISTING_PARCA:-false}"
 DRY_RUN="${DRY_RUN:-false}"
 PARCA_AGENT_REV="${PARCA_AGENT_REV:-v0.39.3}" # Default to a specific version
@@ -234,9 +233,10 @@ start_local_agent() {
 start_docker_agent() {
     log "Starting parca-agent in Docker..."
 
-    # Clean up old container
-    docker stop "$AGENT_CONTAINER_NAME" 2>/dev/null || true
-    docker rm "$AGENT_CONTAINER_NAME" 2>/dev/null || true
+    if docker ps | grep -q "$AGENT_CONTAINER_NAME"; then
+        log "parca-agent container is already running"
+        return 0
+    fi
 
     # Start parca-agent container
     docker run -d \
@@ -311,16 +311,16 @@ run_memory_tests() {
 run_parallel_memory_tests() {
     local pids=()
     local failed=0
-    
+
     # Create a temporary directory for parallel test logs
     local parallel_log_dir="/tmp/parca-parallel-tests-$$"
     mkdir -p "$parallel_log_dir"
-    
+
     log "Starting $PARALLEL_TESTS parallel test instances..."
-    
+
     for i in $(seq 1 "$PARALLEL_TESTS"); do
         log "Starting test instance $i..."
-        
+
         # Run each test instance in background with unique log
         (
             # Each instance gets its own cgroup to avoid conflicts
@@ -328,23 +328,23 @@ run_parallel_memory_tests() {
             timeout $TEST_TIMEOUT ./run-all-memlimited.sh > "$parallel_log_dir/test-$i.log" 2>&1
             echo $? > "$parallel_log_dir/test-$i.exitcode"
         ) &
-        
+
         pids+=($!)
-        
+
         # Small delay between starts to avoid race conditions
         sleep 0.5
     done
-    
+
     log "Waiting for all test instances to complete..."
-    
+
     # Wait for all background processes
     for i in "${!pids[@]}"; do
         local pid=${pids[$i]}
         local instance=$((i + 1))
-        
+
         wait $pid
         local exit_code=$(cat "$parallel_log_dir/test-$instance.exitcode" 2>/dev/null || echo "255")
-        
+
         if [ $exit_code -eq 0 ]; then
             success "Test instance $instance completed successfully"
         elif [ $exit_code -eq 124 ]; then
@@ -353,17 +353,17 @@ run_parallel_memory_tests() {
         else
             warn "Test instance $instance exited with code $exit_code (may be expected for OOM tests)"
         fi
-        
+
         # Show last few lines of log for debugging
         if [ -f "$parallel_log_dir/test-$instance.log" ]; then
             log "Last 5 lines from test instance $instance:"
             tail -5 "$parallel_log_dir/test-$instance.log" | sed 's/^/  /'
         fi
     done
-    
+
     # Cleanup
     rm -rf "$parallel_log_dir"
-    
+
     if [ $failed -gt 0 ]; then
         warn "$failed test instances had issues, but this may be expected for OOM tests"
     else
@@ -491,7 +491,7 @@ main() {
     # Prerequisites
     check_docker
 
-    stop
+    #stop
 
     # Start Parca server
     start_parca_server

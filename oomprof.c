@@ -39,13 +39,13 @@
 // TODO: Make this runtime configurable without verifier issues
 #define DEBUG_PRINT(fmt, args...) bpf_printk(fmt, ##args)
 
-#define MAX_STACK_DEPTH 128
-#define MAX_BUCKETS_PER_LOOP 2729
+#define MAX_STACK_DEPTH 64
+#define MAX_BUCKETS_PER_CALL 3362
 // Maximum number of tail calls allowed. With MAX_BUCKETS_PER_LOOP=2729, this allows
 // processing up to (10+1) * 2729 = 30,019 buckets, which fits within the 30,000
 // mem_buckets map limit. If this value is increased, mem_buckets max_entries must
 // also be increased proportionally: new_limit >= (MAX_TAIL_CALLS+1) * MAX_BUCKETS_PER_LOOP
-#define MAX_TAIL_CALLS 10
+#define MAX_TAIL_CALLS 30
 
 char __license[] SEC("license") = "Dual MIT/GPL";
 
@@ -82,8 +82,7 @@ struct gobucket_header {
 struct gobucket {
   struct gobucket_header header;
   u64 stk[MAX_STACK_DEPTH];
-  // In Go this structure comes after the stack
-  struct memRecord _wrong_dont_use;
+  struct memRecord mem;
 };
 
 
@@ -125,13 +124,14 @@ struct {
   __uint(max_entries, 1);
 } profile_state SEC(".maps");
 
+#define MAX_BUCKETS 60000
 
 // Default to handle large real programs with many allocation sites
 struct {
   __uint(type, BPF_MAP_TYPE_ARRAY);
   __type(key, u32);
   __type(value, struct gobucket);
-  __uint(max_entries, 30000);
+  __uint(max_entries, MAX_BUCKETS);
 } mem_buckets SEC(".maps");
 
 // Map of go procs to mbuckets address
@@ -177,9 +177,10 @@ struct {
 
 static inline __attribute__((__always_inline__)) int
 record_profile_buckets(void *ctx, struct ProfileState *state) {
-  DEBUG_PRINT("recording profile buckets for pid: %d mbuckets:%llx\n", state->pid, state->gobp);
+  DEBUG_PRINT("recording profile buckets for pid: %d mbuckets:%llx buckets:%d\n", state->pid, state->gobp,state->bucket_count);
   struct gobucket *mbp = 0;
   pid_t pid = state->pid;
+  int err = 0;
   struct GoProc* gop = bpf_map_lookup_elem(&go_procs, &pid);
   if (!gop) {
     DEBUG_PRINT("signal_probe: go_procs lookup failed: %d\n", pid);
@@ -187,7 +188,7 @@ record_profile_buckets(void *ctx, struct ProfileState *state) {
   }
 
   for (u32 i=0; state->gobp != 0; i++, state->gobp = mbp->header.allnext) {
-    if (i >= MAX_BUCKETS_PER_LOOP) {
+    if (i >= MAX_BUCKETS_PER_CALL) {
       state->num_tail_calls++;
       if (state->num_tail_calls > MAX_TAIL_CALLS) {
         DEBUG_PRINT("record_profile_buckets: too many tail calls, aborting\n");
@@ -197,33 +198,43 @@ record_profile_buckets(void *ctx, struct ProfileState *state) {
       return 0;
     }
 
-    int key = i;
+    int key = state->bucket_count;
     mbp = bpf_map_lookup_elem(&mem_buckets, &key);
     if (!mbp) {
       DEBUG_PRINT("mem_buckets lookup failed %d:%llx\n", i, state->gobp);
       return 0;
     }
-    // Read the entire bucket structure in one go
-    // This reads: header + MAX_STACK_DEPTH stack slots + memRecord
-    // TODO, can we just read the stack and the mem
-    u64 total_size = sizeof(struct gobucket_header) +
-                     (MAX_STACK_DEPTH * sizeof(u64)) +
-                     sizeof(struct memRecord);
 
-    if (bpf_probe_read_user(mbp, total_size, (void*)state->gobp)) {
-      // TODO: investigate why this can fail
-      DEBUG_PRINT("failed to read full bucket at %llx\n", state->gobp);
+    // read header first
+    if ((err = bpf_probe_read_user(&mbp->header, sizeof(struct gobucket_header), (void*)state->gobp))) {
+      DEBUG_PRINT("failed to read bucket header at %llx err: %d\n", state->gobp, err);
+      gop->readError = true;
+      break;
+    }
+    // read stack next
+    u64 stack_size = mbp->header.nstk * sizeof(u64);
+    if (stack_size > (MAX_STACK_DEPTH * sizeof(u64))) {
+      DEBUG_PRINT("skipping bucket %d: nstk=%llu > MAX=%d\n ", i, mbp->header.nstk, MAX_STACK_DEPTH);
+      continue;
+    }
+    if ((err = bpf_probe_read_user(&mbp->stk, stack_size, (void*)(state->gobp + sizeof(struct gobucket_header))))) {
+      DEBUG_PRINT("failed to read bucket stack at %llx err: %d\n", state->gobp + sizeof(struct gobucket_header), err);
+      gop->readError = true;
+      break;
+    }
+    // read memRecord last
+    if ((err = bpf_probe_read_user(&mbp->mem, sizeof(struct memRecord), (void*)(state->gobp + sizeof(struct gobucket_header) + stack_size)))) {
+      DEBUG_PRINT("failed to read bucket memRecord at %llx err: %d\n", state->gobp + sizeof(struct gobucket_header) + stack_size, err);
       gop->readError = true;
       break;
     }
 
-    // Skip buckets with stack depth > MAX_STACK_DEPTH
-    if (mbp->header.nstk > MAX_STACK_DEPTH) {
-      DEBUG_PRINT("skipping bucket %d: nstk=%llu > MAX=%d\n", i, mbp->header.nstk, MAX_STACK_DEPTH);
-      gop->maxStackErrors++;
-      continue;
-    }
     state->bucket_count++;
+    // Need this to appease the verifier and allow the
+    if (state->bucket_count >= MAX_BUCKETS) {
+      DEBUG_PRINT("record_profile_buckets: bucket count exceeded max, aborting\n");
+      return 0;
+    }
   }
 
   if (state->gobp == 0) {
