@@ -287,15 +287,16 @@ int oom_mark_victim_handler(struct _trace_event_raw_mark_victim *args) {
     return 0;
   }
 
+  struct GoProc* gop = bpf_map_lookup_elem(&go_procs, &victim_pid);
+  if (!gop) {
+    // If we don't know about him we can't profile him.
+    DEBUG_PRINT("oom_mark_victim: go_procs lookup failed, ignoring %d\n", victim_pid);
+    return 0;
+  }
+
   // Set the target PID in the profile_pid map so signal_probe can read it
   // so we can distinguish true oom kills from non-oom kills.
   *target_pid = victim_pid;
-
-  struct GoProc* gop = bpf_map_lookup_elem(&go_procs, &victim_pid);
-  if (!gop) {
-    DEBUG_PRINT("oommark_victim: go_procs lookup failed, timing issue? %d\n", victim_pid);
-    return 0;
-  }
 
   return 0;
 }

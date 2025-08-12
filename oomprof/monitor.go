@@ -218,6 +218,8 @@ func (s *State) Close() error {
 	setupMutex.Lock()
 	defer setupMutex.Unlock()
 
+	logf("oomprof: closing State and cleaning up resources")
+
 	if s.signalDeliverTP != nil {
 		s.signalDeliverTP.Close()
 		s.signalDeliverTP = nil
