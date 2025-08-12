@@ -95,7 +95,7 @@ type ProfileData struct {
 }
 
 const (
-	lowMemEvent = iota
+	lowMemEvent = iota // currently unused
 	profileEvent
 )
 
@@ -245,7 +245,7 @@ func (s *State) Close() error {
 // setupCommon contains the common initialization logic for both Setup variants
 func setupCommon(ctx context.Context, cfg *Config, profileChan chan<- ProfileData, traceReporter reporter.TraceReporter) (*State, error) {
 	//TODO: check if kernel is older than 5.4 and exit if so
-	log.Debug("Starting BPF object loading...")
+	logf("oomprof: starting BPF object loading...")
 
 	objs, signalDeliverTP, oomMarkVictimTP, err := loadBPF()
 
@@ -279,7 +279,7 @@ func setupCommon(ctx context.Context, cfg *Config, profileChan chan<- ProfileDat
 	}
 
 	// All BPF objects are now loaded successfully
-	log.Debug("All BPF probes attached successfully")
+	logf("oomprof: all BPF probes attached successfully")
 
 	if cfg.LogTracePipe {
 		go readTracePipe(ctx)
@@ -289,20 +289,20 @@ func setupCommon(ctx context.Context, cfg *Config, profileChan chan<- ProfileDat
 
 	go s.monitorEventMap(ctx, s, s.pidToExeInfo)
 
-	log.Debug("Starting main monitoring loop...")
-
-	// Channel to signal when first scan is complete
-	firstScanDone := make(chan struct{})
-
 	// Only run process scanning if not disabled
 	if cfg.ScanInterval > 0 {
+		logf("oomprof: starting process monitoring loop...")
+
+		// Channel to signal when first scan is complete
+		firstScanDone := make(chan struct{})
+
 		// Run the process monitoring loop in a goroutine and return after one scan.
 		go func() {
 			firstScan := true
 			for {
 				select {
 				case <-ctx.Done():
-					log.Debug("Context cancelled, shutting down monitoring loop")
+					logf("oomprof: context cancelled, shutting down monitoring loop")
 					return
 				default:
 					newProcs, err := scanGoProcesses(ctx, seenMap, s.pidToExeInfo)
@@ -337,15 +337,11 @@ func setupCommon(ctx context.Context, cfg *Config, profileChan chan<- ProfileDat
 		// Wait for first scan to complete before returning
 		select {
 		case <-firstScanDone:
-			log.Debug("First Go process scan completed")
+			logf("oomprof: first Go process scan completed")
 		case <-ctx.Done():
 			s.Close()
 			return nil, ctx.Err()
 		}
-	} else {
-		// If process scanning is disabled, mark first scan as done immediately
-		close(firstScanDone)
-		log.Debug("Process scanning disabled")
 	}
 
 	return s, nil
@@ -378,7 +374,7 @@ func (s *State) reportBucketsAsTraces(allBuckets []bpfGobucket, pid uint32, comm
 	// Get the FileID for this buildID
 	fileID, hasMapping := s.GetFileIDForBuildID(buildID)
 	if !hasMapping {
-		log.WithField("buildID", buildID).Warn("No FileID mapping found for buildID, using default FileID")
+		logf("oomprof: no FileID mapping found for buildID %s, using default FileID", buildID)
 		// Use a default FileID - may need to be adjusted based on actual FileID type
 		var defaultFileID libpf.FileID
 		fileID = defaultFileID
@@ -464,11 +460,11 @@ func (s *State) reportBucketsAsTraces(allBuckets []bpfGobucket, pid uint32, comm
 
 		// Report the trace event
 		if err := s.traceReporter.ReportTraceEvent(trace, meta); err != nil {
-			log.WithError(err).WithField("bucket_hash", bucket.Header.Hash).Warn("Failed to report trace event")
+			logf("oomprof: failed to report trace event: %v", err)
 		}
 	}
 
-	log.WithField("pid", pid).Info("Successfully reported all traces")
+	log.Infof("oomprof: reported all traces for PID:%v", pid)
 	return nil
 }
 
@@ -501,10 +497,10 @@ func loadBPF() (*bpfObjects, link.Link, link.Link, error) {
 		// Try to find VerifierError in the error chain
 		var verr *ebpf.VerifierError
 		if errors.As(err, &verr) {
-			fmt.Printf("Verifier error details:\n%+v\n", verr)
+			log.Errorf("oomprof: verifier error details:\n%+v\n", verr)
 		} else {
 			// Try unwrapping the error
-			fmt.Printf("BPF load error: %+v\n", err)
+			log.Errorf("oomprof: BPF load error: %+v\n", err)
 			// Check each level of the error chain
 			currentErr := err
 			for i := 0; i < 10; i++ {
@@ -513,7 +509,7 @@ func loadBPF() (*bpfObjects, link.Link, link.Link, error) {
 					break
 				}
 				if errors.As(currentErr, &verr) {
-					fmt.Printf("Found VerifierError at level %d:\n%+v\n", i+1, verr)
+					log.Errorf("oomprof: found VerifierError at level %d:\n%+v\n", i+1, verr)
 					break
 				}
 			}
@@ -521,7 +517,7 @@ func loadBPF() (*bpfObjects, link.Link, link.Link, error) {
 
 		return nil, nil, nil, fmt.Errorf("loading objects: %v", err)
 	}
-	log.WithField("duration", time.Since(loadStart)).Debug("BPF objects loaded")
+	logf("oomprof: loaded BPF programs and maps in %v", time.Since(loadStart))
 
 	// Register tail call program for bucket processing
 	tailCallIndex := uint32(0) // RECORD_PROFILE_BUCKETS_PROG = 0
@@ -566,7 +562,7 @@ func (s *State) addGoProcess(pid uint32, mbucketsAddr uint64) error {
 		ReportAlloc: s.config.ReportAlloc,
 	}
 	if err := s.maps.GoProcs.Put(pid, &goProc); err != nil {
-		log.WithError(err).WithField("pid", pid).Error("error putting PID into go_procs map")
+		log.WithError(err).WithField("pid", pid).Error("oomprof: error putting PID into go_procs map")
 		return err
 	}
 	return nil
@@ -593,8 +589,6 @@ func (s *State) WatchPid(pid uint32) error {
 	// Mark PID as seen immediately to avoid duplicate work
 	s.seenPIDs.Add(pid, struct{}{})
 
-	log.WithField("pid", pid).Debug("Adding new PID to oomprof monitoring")
-
 	// Background the expensive work (ELF parsing and symbol lookup)
 	go func(pid uint32) {
 		s.addProcess(pid)
@@ -615,8 +609,6 @@ func (s *State) watchPIDSync(pid uint32) error {
 	// Mark PID as seen immediately to avoid duplicate work
 	s.seenPIDs.Add(pid, struct{}{})
 
-	log.WithField("pid", pid).Debug("Adding new PID to oomprof monitoring")
-
 	// Synchronously add the process
 	return s.addProcess(pid)
 }
@@ -625,21 +617,18 @@ func (s *State) addProcess(pid uint32) error {
 	// Look up the mbuckets address for this PID
 	mbucketsAddr, err := s.getMBucketsAddrForPID(pid, s.pidToExeInfo)
 	if err != nil {
-		log.WithError(err).WithField("pid", pid).Debug("Failed to get mbuckets address for PID")
+		logf("oomprof: failed to get mbuckets address for PID %d: %v", pid, err)
 		return err
 	}
 
-	log.WithFields(log.Fields{
-		"pid":          pid,
-		"mbucketsAddr": fmt.Sprintf("0x%x", mbucketsAddr),
-	}).Debug("Successfully resolved mbuckets address")
+	logf("oomprof: resolved mbuckets address for PID %d: 0x%x", pid, mbucketsAddr)
 
 	// Add to eBPF monitoring
 	if err := s.addGoProcess(pid, mbucketsAddr); err != nil {
-		log.WithError(err).WithField("pid", pid).Debug("Failed to add Go process to eBPF monitoring")
+		log.WithError(err).WithField("pid", pid).Error("oomprof: failed to add Go process to eBPF monitoring")
 		return err
 	}
-	log.WithField("pid", pid).Debug("Successfully added PID to oomprof monitoring")
+	logf("oomprof: successfully added PID %d to eBPF monitoring", pid)
 	return nil
 }
 
@@ -670,7 +659,7 @@ func (s *State) getMBucketsAddrForPID(pid uint32, pidToExeInfo *sync.Map) (uint6
 	// Get the BuildID
 	buildID, err := elfFile.GetBuildID()
 	if err != nil {
-		log.WithError(err).WithField("pid", pid).Debug("error getting build ID for PID")
+		logf("oomprof: failed to get build ID for PID %d, using empty string", pid)
 		buildID = "" // Use empty string if we can't get the build ID
 	}
 
@@ -693,13 +682,8 @@ func (s *State) getMBucketsAddrForPID(pid uint32, pidToExeInfo *sync.Map) (uint6
 	}
 	pidToExeInfo.Store(pid, exeInfo)
 
-	log.WithFields(log.Fields{
-		"pid":       pid,
-		"mbuckets":  fmt.Sprintf("0x%x", mbucketsAddr.Address),
-		"buildID":   buildID,
-		"exePath":   realExePath,
-		"goVersion": goVersion,
-	}).Debug("Successfully resolved mbuckets address for PID")
+	logf("oomprof: resolved mbuckets address for PID %d: 0x%x, buildID: %s, exePath: %s, goVersion: %s",
+		pid, mbucketsAddr.Address, buildID, realExePath, goVersion)
 
 	return uint64(mbucketsAddr.Address), nil
 }
@@ -720,14 +704,14 @@ func (s *State) capturePprofLabels(ctx context.Context) {
 // This includes removing it from the eBPF go_procs map, pidToExeInfo map,
 // seenPIDs cache, and oomdPids cache (if present).
 func (s *State) UnwatchPid(pid uint32) {
-	log.WithField("pid", pid).Debug("Removing PID from oomprof monitoring")
+	logf("oomprof: removing PID %d from oomprof monitoring", pid)
 
 	// Check if this PID is currently being profiled
 	var key uint32 = 0
 	var currentProfilePid int32
 	if err := s.maps.ProfilePid.Lookup(key, &currentProfilePid); err == nil && currentProfilePid == int32(pid) {
 		// This PID is currently being profiled, delay cleanup to allow perf_event processing
-		log.WithField("pid", pid).Debug("PID is currently being profiled, delaying cleanup")
+		logf("oomprof: PID %d is currently being profiled, delaying cleanup", pid)
 
 		// Fork a background goroutine to handle delayed cleanup
 		go func() {
@@ -738,14 +722,14 @@ func (s *State) UnwatchPid(pid uint32) {
 				var delayedProfilePid int32
 				if err := s.maps.ProfilePid.Lookup(key, &delayedProfilePid); err != nil || delayedProfilePid != int32(pid) {
 					// profile_pid has been cleared or changed to a different PID
-					log.WithField("pid", pid).Debug("profile_pid cleared or changed, proceeding with cleanup")
+					logf("oomprof: profile_pid for PID %d has been cleared or changed to %d", pid, delayedProfilePid)
 					s.performPidCleanup(pid)
 					return
 				}
 			}
 
 			// Timeout after 5 seconds, proceed with cleanup anyway
-			log.WithField("pid", pid).Warn("Timeout waiting for profile_pid to clear, proceeding with cleanup")
+			log.WithField("pid", pid).Error("oomprof: timeout waiting for profile_pid to clear, proceeding with cleanup")
 			s.performPidCleanup(pid)
 		}()
 		return
@@ -773,7 +757,7 @@ func (s *State) performPidCleanup(pid uint32) {
 		s.oomdPids.Remove(pid)
 	}
 
-	log.WithField("pid", pid).Debug("Successfully removed PID from oomprof monitoring")
+	logf("oomprof: removed PID %d from all tracking maps and caches", pid)
 }
 
 // ProfilePid profiles a specific PID by setting it in the profile_pid map and sending a signal.
@@ -816,7 +800,7 @@ func (s *State) ProfilePid(ctx context.Context, pid uint32) error {
 	// copy pprof labels
 	s.capturePprofLabels(ctx)
 
-	log.WithField("pid", pid).Info("Sent SIGUSR1 to PID, waiting for profile...")
+	log.WithField("pid", pid).Info("oomprof: sent SIGUSR1 to PID, waiting for profile...")
 
 	// Wait for profile_pid to be reset to 0 by monitorEventMap
 	for {
@@ -829,7 +813,7 @@ func (s *State) ProfilePid(ctx context.Context, pid uint32) error {
 				return fmt.Errorf("failed to check profile_pid: %w", err)
 			}
 			if currentPid == 0 {
-				log.WithField("pid", pid).Info("Profile for PID completed")
+				log.WithField("pid", pid).Info("oomprof: profile for PID completed")
 				return nil
 			}
 		}
@@ -874,7 +858,7 @@ func processBuckets(maps *bpfMaps, numBuckets uint32) ([]bpfGobucket, error) {
 		}
 	}
 
-	log.WithFields(log.Fields{"retrieved": len(allBuckets), "total": numBuckets}).Info("Retrieved buckets")
+	log.WithFields(log.Fields{"retrieved": len(allBuckets), "total": numBuckets}).Info("oomprof: retrieved buckets")
 
 	return allBuckets, nil
 }
@@ -886,7 +870,7 @@ func readProfile(allBuckets []bpfGobucket, binaryPath string, buildID string, sy
 	if err != nil {
 		return nil, fmt.Errorf("failed to convert buckets to pprof: %v", err)
 	}
-	log.WithField("duration", time.Since(convertStart)).Info("Converted buckets to pprof")
+	logf("oomprof: converted %d buckets to pprof format in %v", len(allBuckets), time.Since(convertStart))
 
 	return prof, nil
 }
@@ -894,7 +878,7 @@ func readProfile(allBuckets []bpfGobucket, binaryPath string, buildID string, sy
 func (s *State) monitorEventMap(ctx context.Context, state *State, pidToExeInfo *sync.Map) {
 	eventReader, err := perf.NewReader(state.maps.SignalEvents, 1)
 	if err != nil {
-		log.WithError(err).Error("error creating perf reader")
+		log.WithError(err).Error("oomprof: error creating perf reader")
 		return
 	}
 	defer eventReader.Close()
@@ -916,11 +900,11 @@ func (s *State) monitorEventMap(ctx context.Context, state *State, pidToExeInfo 
 				if errors.Is(err, perf.ErrClosed) {
 					return
 				}
-				log.WithError(err).Error("reading from perf event reader")
+				log.WithError(err).Error("oomprof: reading from perf event reader")
 				continue
 			}
 			if rec.LostSamples != 0 {
-				log.WithField("lost_samples", rec.LostSamples).Warn("perf event ring buffer full")
+				log.WithField("lost_samples", rec.LostSamples).Warn("oomprof: perf event ring buffer full")
 				continue
 			}
 			// Extract the PID from the raw sample data
@@ -932,7 +916,7 @@ func (s *State) monitorEventMap(ctx context.Context, state *State, pidToExeInfo 
 			switch ev.EventType {
 			case profileEvent:
 				pid = ev.Payload
-				log.WithField("pid", pid).Info("Received profile event for PID")
+				log.WithField("pid", pid).Info("oomprof: received profile event for PID")
 				// Read pprof data
 
 				var gop bpfGoProc
@@ -940,7 +924,7 @@ func (s *State) monitorEventMap(ctx context.Context, state *State, pidToExeInfo 
 					log.WithError(err).WithField("pid", pid).Error("error getting PID from go_procs map")
 					continue
 				}
-				log.WithFields(log.Fields{"pid": pid, "buckets": gop.NumBuckets, "complete": gop.Complete, "read_error": gop.ReadError}).Info("Got profile event")
+				logf("oomprof: got profile event for PID %d with buckets %d, complete: %t, read_error: %t", pid, gop.NumBuckets, gop.Complete, gop.ReadError)
 
 				// Retrieve the exe info from the sync.Map
 				var exeInfo *ExeInfo
@@ -951,10 +935,7 @@ func (s *State) monitorEventMap(ctx context.Context, state *State, pidToExeInfo 
 					exeInfo = &ExeInfo{Path: "", BuildID: ""}
 				}
 
-				log.WithFields(log.Fields{
-					"pid":     pid,
-					"exePath": exeInfo.Path,
-					"buildID": exeInfo.BuildID}).Info("Retrieved executable info for PID")
+				logf("oomprof: retrieved exe info for PID %d: path=%s, buildID=%s", pid, exeInfo.Path, exeInfo.BuildID)
 
 				// Extract command name from exe path
 				command := "unknown"
@@ -970,7 +951,7 @@ func (s *State) monitorEventMap(ctx context.Context, state *State, pidToExeInfo 
 				// Read buckets from eBPF map
 				allBuckets, err := processBuckets(state.maps, gop.NumBuckets)
 				if err != nil {
-					log.WithError(err).WithField("pid", pid).Error("error reading buckets for PID")
+					log.WithError(err).WithField("pid", pid).Error("oomprof: error reading buckets for PID")
 					continue
 				}
 
@@ -1013,26 +994,16 @@ func (s *State) monitorEventMap(ctx context.Context, state *State, pidToExeInfo 
 					// TraceReporter mode
 					err = state.reportBucketsAsTraces(allBuckets, pid, command, exeInfo.Path, exeInfo.BuildID)
 					if err != nil {
-						log.WithError(err).WithField("pid", pid).Error("error reporting traces for PID")
+						log.WithError(err).WithField("pid", pid).Error("oomprof: error reporting traces for PID")
 					} else {
-						log.WithField("pid", pid).Debug("Successfully reported traces for PID")
+						logf("oomprof: successfully reported traces for PID %d", pid)
 						// Clear the profile_pid map after successfully reporting
 						var key uint32 = 0
 						var pidValue int32 = 0
 						if err := state.maps.ProfilePid.Put(key, pidValue); err != nil {
-							log.WithError(err).Error("Failed to clear profile_pid map")
+							log.WithError(err).Error("oomprof: failed to clear profile_pid map")
 						}
 					}
-				}
-			case lowMemEvent:
-				pid = ev.Payload
-				log.WithField("pid", pid).Debug("Received lowMemEvent for PID")
-
-				// Send SIGUSR1 signal to the target process
-				if err := syscall.Kill(int(pid), syscall.SIGUSR1); err != nil {
-					log.WithError(err).WithField("pid", pid).Error("Failed to send SIGUSR1 to PID")
-				} else {
-					log.WithField("pid", pid).Debug("Successfully sent SIGUSR1 to PID")
 				}
 			}
 		}

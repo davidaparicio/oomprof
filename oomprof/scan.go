@@ -140,7 +140,7 @@ func scanGoProcesses(ctx context.Context, goProcs map[uint32]int64, pidToExeInfo
 		}
 
 		goProcs[uint32(pid)] = int64(mbucketsAddr.Address)
-		log.WithFields(log.Fields{"pid": pid, "mbuckets": fmt.Sprintf("%x", mbucketsAddr.Address), "comm": strings.TrimSpace(string(comm)), "cmdline": cmdlineStr, "buildid": buildID}).Debug("Found Go program")
+		log.WithFields(log.Fields{"pid": pid, "mbuckets": fmt.Sprintf("%x", mbucketsAddr.Address), "comm": strings.TrimSpace(string(comm)), "cmdline": cmdlineStr, "buildid": buildID}).Debug("oomprof: found Go program")
 
 		// Store the PID to exe info mapping in the sync.Map
 		exeInfo := &ExeInfo{
@@ -168,13 +168,13 @@ func scanGoProcesses(ctx context.Context, goProcs map[uint32]int64, pidToExeInfo
 // GoProcessInfo holds information about a running Go process.
 type GoProcessInfo struct {
 	// PID is the process ID.
-	PID          uint32
+	PID uint32
 	// GoVersion is the Go version of the process.
-	GoVersion    string
+	GoVersion string
 	// MBucketsAddr is the address of the mbuckets symbol in memory.
 	MBucketsAddr uint64
 	// CmdLine is the command line used to start the process.
-	CmdLine      string
+	CmdLine string
 	// ExePath is the path to the executable.
-	ExePath      string
+	ExePath string
 }
