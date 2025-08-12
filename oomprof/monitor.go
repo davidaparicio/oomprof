@@ -759,6 +759,14 @@ func (s *State) performPidCleanup(pid uint32) {
 		s.oomdPids.Remove(pid)
 	}
 
+	// Clear the profile_pid map, it appears we can pick a process to be a victim and then
+	// decide not to kill it so this handles that case.
+	var key uint32 = 0
+	var pidValue int32 = 0
+	if err := s.maps.ProfilePid.Put(key, pidValue); err != nil {
+		log.WithError(err).Error("Failed to clear profile_pid map")
+	}
+
 	logf("oomprof: removed PID %d from all tracking maps and caches", pid)
 }
 
