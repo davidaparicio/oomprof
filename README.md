@@ -169,6 +169,7 @@ sudo go test -v ./oomprof -run TestOOMProfLowMemoryLimits
 │                 │    │ │ buckets      │ │    │                 │
 └─────────────────┘    │ └──────────────┘ │    └─────────────────┘
                        └──────────────────┘
+```
 
 ## Development
 
