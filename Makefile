@@ -25,10 +25,9 @@ tests: generate
 	go test -tags $(GO_TAGS) -ldflags='-extldflags=-static' -c -o ./tests/oomprof.test ./oomprof
 	go build -tags $(GO_TAGS) -ldflags='-extldflags=-static' -o ./tests/oomer.taux ./tests/oomer
 	go build -tags $(GO_TAGS) -ldflags='-extldflags=-static' -o ./tests/gccache.taux ./tests/gccache
-	go build -tags $(GO_TAGS) -ldflags='-extldflags=-static' -o ./tests/compile-oom.taux ./tests/compile-oom
 
 cgroup-tests: tests
-	cd tests && sudo ./oomprof.test -test.v -test.run TestOOMProf 2>&1 | tee oomprof.log
+	cd tests && sudo ./oomprof.test -test.timeout 5m -test.v -test.run TestOOMProf 2>&1 | tee oomprof.log
 
 tests-arm64:
 	GOARCH=arm64 go generate ./oomprof

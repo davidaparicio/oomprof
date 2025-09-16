@@ -27,7 +27,8 @@ type bpfGoProc struct {
 	ReadError      bool
 	Complete       bool
 	ReportAlloc    bool
-	_              [5]byte
+	Started        bool
+	_              [4]byte
 }
 
 type bpfGobucket struct {

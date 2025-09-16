@@ -88,11 +88,12 @@ struct gobucket {
 
 struct GoProc {
   u64 mbuckets; // static doesn't change
-  u32 num_buckets;  // updated after each profile is recorded
+  u32 num_buckets;  // updated after profile is recorded
   u32 maxStackErrors;
   bool readError;
   bool complete;
   bool reportAlloc; // whether to report alloc metrics or just inuse
+  bool started; // whether the process has started profiling
 };
 
 struct Event {
@@ -321,10 +322,11 @@ int signal_probe(struct trace_event_raw_signal_deliver *ctx) {
   }
   DEBUG_PRINT("signal_probe: target pid == current pid, proceeding\n");
   // num_buckets reset after reading, ignore if not zero.
-  if (gop->num_buckets > 0) {
+  if (gop->started) {
     DEBUG_PRINT("signal_probe: already recorded profile for pid %d, ignoring signal\n", pid);
     return 0;
   }
+  gop->started = true;
   DEBUG_PRINT("go proc %d got signal\n", pid);
 
   struct ProfileState *state = bpf_map_lookup_elem(&profile_state, &key);

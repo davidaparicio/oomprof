@@ -22,7 +22,6 @@ import (
 	"sync"
 
 	log "github.com/sirupsen/logrus"
-	"go.opentelemetry.io/ebpf-profiler/libpf/pfelf"
 )
 
 // scanGoProcesses scans the /proc filesystem for running Go processes
@@ -99,8 +98,9 @@ func scanGoProcesses(ctx context.Context, goProcs map[uint32]int64, pidToExeInfo
 
 		cmdlineStr := strings.Replace(string(cmdline), "\x00", " ", -1)
 
-		// Try to open the executable using pfelf.Open
-		elfFile, err := pfelf.Open(exePath)
+		// Try to open the executable using the ELF reader
+		elfReader := GetELFReader()
+		elfFile, err := elfReader.Open(exePath)
 		if err != nil {
 			// Skip if we can't open the executable (usually permission issues)
 			goProcs[uint32(pid)] = -1
@@ -124,15 +124,8 @@ func scanGoProcesses(ctx context.Context, goProcs map[uint32]int64, pidToExeInfo
 			buildID = "" // Use empty string if we can't get the build ID
 		}
 
-		symtab, err := elfFile.ReadSymbols()
-		if err != nil {
-			log.WithError(err).WithFields(log.Fields{"cmdline": cmdlineStr, "go_version": goVersion, "pid": pid}).Debug("error looking up symbol table")
-			goProcs[uint32(pid)] = -1
-			continue
-		}
-
 		// This is a Go program - look up the mbuckets symbol
-		mbucketsAddr, err := symtab.LookupSymbol("runtime.mbuckets")
+		mbucketsAddr, err := elfFile.LookupSymbol("runtime.mbuckets")
 		if err != nil {
 			log.WithError(err).Error("error looking up mbuckets symbol")
 			goProcs[uint32(pid)] = -1

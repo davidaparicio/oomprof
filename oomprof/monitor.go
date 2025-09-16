@@ -34,13 +34,6 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	lru "github.com/elastic/go-freelru"
-	"go.opentelemetry.io/ebpf-profiler/libpf"
-	"go.opentelemetry.io/ebpf-profiler/libpf/pfelf"
-	"go.opentelemetry.io/ebpf-profiler/support"
-	"go.opentelemetry.io/ebpf-profiler/traceutil"
-
-	"go.opentelemetry.io/ebpf-profiler/reporter"
-	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
 )
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target $GOARCH -tags linux bpf ../oomprof.c
@@ -105,10 +98,7 @@ type State struct {
 	maps *bpfMaps
 	// Either profileChan or traceReporter will be set, not both
 	profileChan   chan<- ProfileData
-	traceReporter reporter.TraceReporter
-	// buildID to FileID mapping for trace reporting
-	buildIDToFileID map[string]libpf.FileID
-	buildIDMutex    sync.RWMutex
+	traceReporter Reporter
 	// pidToExeInfo stores PID to executable info mapping
 	pidToExeInfo *sync.Map
 	// seenPIDs is an LRU cache for tracking PIDs we've already seen (1024 entries matching eBPF map size)
@@ -172,7 +162,7 @@ func Setup(ctx context.Context, cfg *Config, profileChan chan<- ProfileData) (*S
 // SetupWithReporter initializes the eBPF programs and maps with a TraceReporter.
 // Instead of constructing ProfileData, it reports traces directly using the reporter.
 // Returns ErrAlreadyInitialized if Setup has already been called in this process.
-func SetupWithReporter(ctx context.Context, cfg *Config, traceReporter reporter.TraceReporter) (*State, error) {
+func SetupWithReporter(ctx context.Context, cfg *Config, traceReporter Reporter) (*State, error) {
 	setupMutex.Lock()
 	defer setupMutex.Unlock()
 
@@ -245,7 +235,7 @@ func (s *State) Close() error {
 }
 
 // setupCommon contains the common initialization logic for both Setup variants
-func setupCommon(ctx context.Context, cfg *Config, profileChan chan<- ProfileData, traceReporter reporter.TraceReporter) (*State, error) {
+func setupCommon(ctx context.Context, cfg *Config, profileChan chan<- ProfileData, traceReporter Reporter) (*State, error) {
 	//TODO: check if kernel is older than 5.4 and exit if so
 	logf("oomprof: starting BPF object loading...")
 
@@ -271,7 +261,6 @@ func setupCommon(ctx context.Context, cfg *Config, profileChan chan<- ProfileDat
 		maps:            &objs.bpfMaps,
 		profileChan:     profileChan,
 		traceReporter:   traceReporter,
-		buildIDToFileID: make(map[string]libpf.FileID),
 		pidToExeInfo:    pidToExeInfo,
 		seenPIDs:        seenPIDs,
 		config:          cfg,
@@ -317,7 +306,9 @@ func setupCommon(ctx context.Context, cfg *Config, profileChan chan<- ProfileDat
 						continue
 					}
 					for _, p := range newProcs {
-						s.addGoProcess(p.PID, p.MBucketsAddr)
+						if err := s.addGoProcess(p.PID, p.MBucketsAddr); err != nil {
+							logf("oomprof: failed to add go process %d: %v", p.PID, err)
+						}
 					}
 
 					// Signal that first scan is complete
@@ -349,120 +340,92 @@ func setupCommon(ctx context.Context, cfg *Config, profileChan chan<- ProfileDat
 	return s, nil
 }
 
-// RegisterBuildIDToFileID registers a mapping from buildID to FileID for trace reporting.
-// This must be called to enable proper FileID mapping in traces.
-func (s *State) RegisterBuildIDToFileID(buildID string, fileID libpf.FileID) {
-	s.buildIDMutex.Lock()
-	defer s.buildIDMutex.Unlock()
-	s.buildIDToFileID[buildID] = fileID
-}
-
-// GetFileIDForBuildID retrieves the FileID for a given buildID.
-// Returns the FileID and true if found, or zero FileID and false if not found.
-func (s *State) GetFileIDForBuildID(buildID string) (libpf.FileID, bool) {
-	s.buildIDMutex.RLock()
-	defer s.buildIDMutex.RUnlock()
-	fileID, ok := s.buildIDToFileID[buildID]
-	return fileID, ok
-}
-
 // ReportBucketsAsTraces converts memory buckets to traces and reports them using the TraceReporter.
-// This method uses the registered buildID to FileID mappings to provide proper FileIDs in traces.
 func (s *State) reportBucketsAsTraces(allBuckets []bpfGobucket, pid uint32, command string, binaryPath string, buildID string) error {
 	if s.traceReporter == nil {
 		return fmt.Errorf("no trace reporter configured")
 	}
 
-	// Get the FileID for this buildID
-	fileID, hasMapping := s.GetFileIDForBuildID(buildID)
-	if !hasMapping {
-		logf("oomprof: no FileID mapping found for buildID %s, using default FileID", buildID)
-		// Use a default FileID - may need to be adjusted based on actual FileID type
-		var defaultFileID libpf.FileID
-		fileID = defaultFileID
-	}
-
-	ts := libpf.UnixTime64(time.Now().UnixNano())
-
-	trace := &libpf.Trace{}
-
-	// reuse the TraceEventMeta object, this should probably be declared somewhere.
-	meta := &samples.TraceEventMeta{
+	const batchSize = 1000
+	ts := uint64(time.Now().UnixNano())
+	meta := SampleMeta{
 		Timestamp:      ts,
 		Comm:           command,
 		ProcessName:    command,
 		ExecutablePath: binaryPath,
-		PID:            libpf.PID(pid),
-		Origin:         support.TraceOriginMemory, // Custom origin for memory profiling
+		PID:            pid,
+		CustomLabels:   s.labels,
+		BuildID:        buildID,
 	}
 
-	// Convert buckets to traces and report them
-	for _, bucket := range allBuckets {
-		mr := bucket.Mem
-		allocs := mr.Active.Allocs
-		frees := mr.Active.Frees
-		allocBytes := mr.Active.AllocBytes
-		freeBytes := mr.Active.FreeBytes
-
-		// Calculate inuse metrics
-		inuse := mr.Active.Allocs - mr.Active.Frees
-		inuseBytes := mr.Active.AllocBytes - mr.Active.FreeBytes
-
-		// Aggregate future allocations
-		for i := 0; i < 3; i++ {
-			allocs += mr.Future[i].Allocs
-			frees += mr.Future[i].Frees
-			allocBytes += mr.Future[i].AllocBytes
-			freeBytes += mr.Future[i].FreeBytes
-			inuse += mr.Future[i].Allocs - mr.Future[i].Frees
-			inuseBytes += mr.Future[i].AllocBytes - mr.Future[i].FreeBytes
+	// Process buckets in batches of 1000
+	for batchStart := 0; batchStart < len(allBuckets); batchStart += batchSize {
+		batchEnd := batchStart + batchSize
+		if batchEnd > len(allBuckets) {
+			batchEnd = len(allBuckets)
 		}
 
-		// Skip buckets based on ReportAlloc setting
-		if !s.config.ReportAlloc && inuse == 0 {
-			// When only reporting inuse, skip buckets with zero inuse
-			continue
-		}
+		// Create slices for this batch
+		var samples []Sample
 
-		// Build the trace from the stack
-		stackLen := int(bucket.Header.Nstk)
-		fileIDs := make([]libpf.FileID, 0, stackLen)
-		linenos := make([]libpf.AddressOrLineno, 0, stackLen)
-		frameTypes := make([]libpf.FrameType, 0, stackLen)
-		// mappingStarts := make([]libpf.Address, 0, stackLen)
-		// mappingEnds := make([]libpf.Address, 0, stackLen)
-		// mappingFileOffsets := make([]uint64, 0, stackLen)
+		// Process buckets in this batch
+		for _, bucket := range allBuckets[batchStart:batchEnd] {
+			mr := bucket.Mem
+			allocs := mr.Active.Allocs
+			frees := mr.Active.Frees
+			allocBytes := mr.Active.AllocBytes
+			freeBytes := mr.Active.FreeBytes
 
-		for i := 0; i < stackLen; i++ {
-			addr := bucket.Stk[i]
-			if addr == 0 {
-				break
+			// Calculate inuse metrics
+			inuse := mr.Active.Allocs - mr.Active.Frees
+			inuseBytes := mr.Active.AllocBytes - mr.Active.FreeBytes
+
+			// Aggregate future allocations
+			// TODO: disable this for non-OOM situations
+			for i := 0; i < 3; i++ {
+				allocs += mr.Future[i].Allocs
+				frees += mr.Future[i].Frees
+				allocBytes += mr.Future[i].AllocBytes
+				freeBytes += mr.Future[i].FreeBytes
+				inuse += mr.Future[i].Allocs - mr.Future[i].Frees
+				inuseBytes += mr.Future[i].AllocBytes - mr.Future[i].FreeBytes
 			}
 
-			// Use the registered FileID for this buildID
-			fileIDs = append(fileIDs, fileID)
-			linenos = append(linenos, libpf.AddressOrLineno(addr))
-			frameTypes = append(frameTypes, libpf.NativeFrame)
-			// mappingStarts = append(mappingStarts, 0)
-			// mappingEnds = append(mappingEnds, ^libpf.Address(0))
-			// mappingFileOffsets = append(mappingFileOffsets, 0)
+			// Skip buckets based on ReportAlloc setting
+			if !s.config.ReportAlloc && inuse == 0 {
+				// When only reporting inuse, skip buckets with zero inuse
+				continue
+			}
+
+			// Build the sample from the stack
+			stackLen := int(bucket.Header.Nstk)
+			addresses := make([]Address, 0, stackLen)
+
+			for i := 0; i < stackLen; i++ {
+				addr := bucket.Stk[i]
+				if addr == 0 {
+					break
+				}
+				addresses = append(addresses, Address(addr))
+			}
+
+			sample := Sample{
+				Addresses:  addresses,
+				Allocs:     allocs,
+				Frees:      frees,
+				AllocBytes: allocBytes,
+				FreeBytes:  freeBytes,
+			}
+
+			samples = append(samples, sample)
 		}
 
-		trace.Files = fileIDs
-		trace.Linenos = linenos
-		trace.FrameTypes = frameTypes
-		trace.CustomLabels = s.labels
-		trace.Hash = traceutil.HashTrace(trace)
-
-		// Always report accurate Allocs/Frees - let downstream do the inuse calculation
-		meta.Allocs = allocs
-		meta.Frees = frees
-		meta.AllocBytes = allocBytes
-		meta.FreeBytes = freeBytes
-
-		// Report the trace event
-		if err := s.traceReporter.ReportTraceEvent(trace, meta); err != nil {
-			logf("oomprof: failed to report trace event: %v", err)
+		// Report this batch if we have any samples
+		if len(samples) > 0 {
+			if err := s.traceReporter.SampleEvents(samples, meta); err != nil {
+				logf("oomprof: failed to report batch of %d trace events: %v", len(samples), err)
+				// Continue processing other batches even if one fails
+			}
 		}
 	}
 
@@ -593,7 +556,9 @@ func (s *State) WatchPid(pid uint32) error {
 
 	// Background the expensive work (ELF parsing and symbol lookup)
 	go func(pid uint32) {
-		s.addProcess(pid)
+		if err := s.addProcess(pid); err != nil {
+			logf("oomprof: failed to add process %d: %v", pid, err)
+		}
 	}(pid)
 
 	return nil
@@ -645,8 +610,9 @@ func (s *State) getMBucketsAddrForPID(pid uint32, pidToExeInfo *sync.Map) (uint6
 		return 0, fmt.Errorf("failed to read exe link for PID %d: %w", pid, err)
 	}
 
-	// Try to open the executable using pfelf.Open
-	elfFile, err := pfelf.Open(exePath)
+	// Try to open the executable using the ELF reader
+	elfReader := GetELFReader()
+	elfFile, err := elfReader.Open(exePath)
 	if err != nil {
 		return 0, fmt.Errorf("failed to open ELF file for PID %d: %w", pid, err)
 	}
@@ -665,14 +631,8 @@ func (s *State) getMBucketsAddrForPID(pid uint32, pidToExeInfo *sync.Map) (uint6
 		buildID = "" // Use empty string if we can't get the build ID
 	}
 
-	// Read the symbol table
-	symtab, err := elfFile.ReadSymbols()
-	if err != nil {
-		return 0, fmt.Errorf("failed to read symbols for PID %d: %w", pid, err)
-	}
-
 	// Look up the mbuckets symbol
-	mbucketsAddr, err := symtab.LookupSymbol("runtime.mbuckets")
+	mbucketsAddr, err := elfFile.LookupSymbol("runtime.mbuckets")
 	if err != nil {
 		return 0, fmt.Errorf("failed to find runtime.mbuckets symbol for PID %d: %w", pid, err)
 	}
@@ -687,7 +647,7 @@ func (s *State) getMBucketsAddrForPID(pid uint32, pidToExeInfo *sync.Map) (uint6
 	logf("oomprof: resolved mbuckets address for PID %d: 0x%x, buildID: %s, exePath: %s, goVersion: %s",
 		pid, mbucketsAddr.Address, buildID, realExePath, goVersion)
 
-	return uint64(mbucketsAddr.Address), nil
+	return mbucketsAddr.Address, nil
 }
 
 // capturePprofLabels captures current pprof labels and stores them in the state
@@ -803,7 +763,9 @@ func (s *State) ProfilePid(ctx context.Context, pid uint32) error {
 	// Send SIGUSR1 to trigger profile collection
 	if err := syscall.Kill(int(pid), syscall.SIGUSR1); err != nil {
 		// Reset profile_pid on error
-		s.maps.ProfilePid.Put(key, int32(0))
+		if err := s.maps.ProfilePid.Put(key, int32(0)); err != nil {
+			logf("oomprof: failed to reset profile_pid: %v", err)
+		}
 		return fmt.Errorf("failed to send SIGUSR1 to PID %d: %w", pid, err)
 	}
 
@@ -891,12 +853,18 @@ func (s *State) monitorEventMap(ctx context.Context, state *State, pidToExeInfo 
 		log.WithError(err).Error("oomprof: error creating perf reader")
 		return
 	}
-	defer eventReader.Close()
+	defer func() {
+		if err := eventReader.Close(); err != nil {
+			logf("oomprof: failed to close event reader: %v", err)
+		}
+	}()
 
 	// Close reader when context is cancelled
 	go func() {
 		<-ctx.Done()
-		eventReader.Close()
+		if err := eventReader.Close(); err != nil {
+			logf("oomprof: failed to close event reader: %v", err)
+		}
 	}()
 
 	for {
@@ -926,15 +894,13 @@ func (s *State) monitorEventMap(ctx context.Context, state *State, pidToExeInfo 
 			switch ev.EventType {
 			case profileEvent:
 				pid = ev.Payload
-				log.WithField("pid", pid).Info("oomprof: received profile event for PID")
-				// Read pprof data
 
 				var gop bpfGoProc
 				if err := state.maps.GoProcs.Lookup(pid, &gop); err != nil {
 					log.WithError(err).WithField("pid", pid).Error("error getting PID from go_procs map")
 					continue
 				}
-				logf("oomprof: got profile event for PID %d with buckets %d, complete: %t, read_error: %t", pid, gop.NumBuckets, gop.Complete, gop.ReadError)
+				log.Infof("oomprof: got profile event for PID %d with buckets %d, complete: %t, read_error: %t", pid, gop.NumBuckets, gop.Complete, gop.ReadError)
 
 				// Retrieve the exe info from the sync.Map
 				var exeInfo *ExeInfo
