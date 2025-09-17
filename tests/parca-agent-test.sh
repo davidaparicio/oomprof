@@ -514,6 +514,8 @@ main() {
         error "Integration test FAILED! Expected OOM profiles were not found in Parca."
         exit 1
     fi
+
+    stop
 }
 
 # Parse command line arguments
