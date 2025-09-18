@@ -22,6 +22,7 @@ import (
 	"github.com/google/pprof/profile"
 )
 
+var ErrSelfWatch = errors.New("oomprof: cannot watch current process")
 var ErrNotLinux = errors.New("oomprof requires Linux kernel with eBPF support")
 
 func Setup() error {
@@ -30,6 +31,10 @@ func Setup() error {
 
 func Monitor(ctx context.Context) error {
 	return ErrNotLinux
+}
+
+func GetState() (*State, error) {
+	return nil, ErrNotLinux
 }
 
 func GetCurrentState() *State {
@@ -76,4 +81,11 @@ func (s *State) GetDebugInfo() string {
 
 func (s *State) Start() error {
 	return ErrNotLinux
+}
+
+func (s *State) WatchPid(pid uint32) error {
+	return ErrNotLinux
+}
+
+func (s *State) UnwatchPid(pid uint32) {
 }
