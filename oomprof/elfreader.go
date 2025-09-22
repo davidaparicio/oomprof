@@ -14,13 +14,13 @@
 package oomprof
 
 import (
+	"debug/buildinfo"
 	"debug/elf"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"os"
-	"strings"
 )
 
 // SymbolInfo represents information about a symbol in an ELF file.
@@ -124,56 +124,16 @@ func (f *defaultELFFile) GetBuildID() (string, error) {
 }
 
 func (f *defaultELFFile) GoVersion() (string, error) {
-	// Look for .go.buildinfo section (Go 1.18+)
-	if sec := f.elfFile.Section(".go.buildinfo"); sec != nil {
-		data, err := sec.Data()
-		if err != nil {
-			return "", err
-		}
-
-		// Parse buildinfo header
-		if len(data) < 32 {
-			return "", errors.New("buildinfo section too small")
-		}
-
-		// The buildinfo format has magic bytes and pointers
-		// For simplicity, we'll look for the version string pattern
-		versionData := string(data)
-		if idx := strings.Index(versionData, "\xfa\xff\xff\xff\x00"); idx >= 0 && idx+5 < len(versionData) {
-			// Read version length and string after the magic pattern
-			remaining := versionData[idx+5:]
-			if len(remaining) > 0 {
-				versionLen := int(remaining[0])
-				if len(remaining) > versionLen {
-					version := remaining[1 : versionLen+1]
-					if strings.HasPrefix(version, "go") {
-						return version, nil
-					}
-				}
-			}
-		}
+	bi, err := buildinfo.Read(f.file)
+	if err != nil {
+		return "", err
 	}
 
-	// Fallback: look for version in .rodata section (older Go versions)
-	if sec := f.elfFile.Section(".rodata"); sec != nil {
-		data, err := sec.Data()
-		if err == nil {
-			rodataStr := string(data)
-			// Look for go version string pattern
-			if idx := strings.Index(rodataStr, "go1."); idx >= 0 {
-				// Extract version (e.g., "go1.20.5")
-				end := idx + 4 // Start after "go1."
-				for end < len(rodataStr) && (rodataStr[end] >= '0' && rodataStr[end] <= '9' || rodataStr[end] == '.') {
-					end++
-				}
-				if end > idx+4 {
-					return rodataStr[idx:end], nil
-				}
-			}
-		}
+	if bi != nil && bi.GoVersion != "" {
+		return bi.GoVersion, nil
 	}
 
-	return "", errors.New("Go version not found")
+	return "", errors.New("go version not found")
 }
 
 func (f *defaultELFFile) LookupSymbol(name string) (SymbolInfo, error) {

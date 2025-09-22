@@ -734,7 +734,6 @@ func (s *State) performPidCleanup(pid uint32) {
 
 // ProfilePid profiles a specific PID by setting it in the profile_pid map and sending a signal.
 // This triggers an immediate memory profile collection for the specified process.
-// The process must already be monitored (via WatchPid or automatic scanning).
 // Returns an error if the PID is not found in the monitored processes.
 func (s *State) ProfilePid(ctx context.Context, pid uint32) error {
 	// Make sure we're watching it.
