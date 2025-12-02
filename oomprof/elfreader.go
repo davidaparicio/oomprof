@@ -16,10 +16,8 @@ package oomprof
 import (
 	"debug/buildinfo"
 	"debug/elf"
-	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 )
 
@@ -93,34 +91,9 @@ func (f *defaultELFFile) Close() error {
 }
 
 func (f *defaultELFFile) GetBuildID() (string, error) {
-	// Try to find build ID in notes sections
-	for _, prog := range f.elfFile.Progs {
-		if prog.Type != elf.PT_NOTE {
-			continue
-		}
-
-		notes, err := readNotes(prog.Open(), f.elfFile.ByteOrder)
-		if err != nil {
-			continue
-		}
-
-		for _, note := range notes {
-			if note.Type == 3 && note.Name == "GNU" { // NT_GNU_BUILD_ID = 3
-				return fmt.Sprintf("%x", note.Desc), nil
-			}
-		}
-	}
-
-	// Try .note.go.buildid section for Go binaries
-	if sec := f.elfFile.Section(".note.go.buildid"); sec != nil {
-		data, err := sec.Data()
-		if err == nil && len(data) > 16 {
-			// Skip the note header (16 bytes) and read the build ID
-			return string(data[16:]), nil
-		}
-	}
-
-	return "", errors.New("build ID not found")
+	// Use the Go standard library's approach to reading build IDs from ELF files.
+	// This handles both Go build IDs and GNU build IDs correctly.
+	return readBuildIDFromELF(f.file, f.elfFile)
 }
 
 func (f *defaultELFFile) GoVersion() (string, error) {
@@ -156,63 +129,6 @@ func (f *defaultELFFile) LookupSymbol(name string) (SymbolInfo, error) {
 	}
 
 	return SymbolInfo{}, fmt.Errorf("symbol %s not found", name)
-}
-
-// note represents an ELF note.
-type note struct {
-	Name string
-	Type uint32
-	Desc []byte
-}
-
-// readNotes reads ELF notes from a reader.
-func readNotes(r io.Reader, order binary.ByteOrder) ([]note, error) {
-	var notes []note
-
-	for {
-		var nameSize, descSize, noteType uint32
-
-		// Read note header
-		if err := binary.Read(r, order, &nameSize); err != nil {
-			if err == io.EOF {
-				break
-			}
-			return notes, err
-		}
-		if err := binary.Read(r, order, &descSize); err != nil {
-			return notes, err
-		}
-		if err := binary.Read(r, order, &noteType); err != nil {
-			return notes, err
-		}
-
-		// Read name (padded to 4 bytes)
-		namePadded := (nameSize + 3) &^ 3
-		nameBytes := make([]byte, namePadded)
-		if _, err := io.ReadFull(r, nameBytes); err != nil {
-			return notes, err
-		}
-
-		name := string(nameBytes[:nameSize])
-		if nameSize > 0 && name[nameSize-1] == 0 {
-			name = name[:nameSize-1]
-		}
-
-		// Read descriptor (padded to 4 bytes)
-		descPadded := (descSize + 3) &^ 3
-		desc := make([]byte, descPadded)
-		if _, err := io.ReadFull(r, desc); err != nil {
-			return notes, err
-		}
-
-		notes = append(notes, note{
-			Name: name,
-			Type: noteType,
-			Desc: desc[:descSize],
-		})
-	}
-
-	return notes, nil
 }
 
 // globalELFReader holds the current ELF reader implementation.
