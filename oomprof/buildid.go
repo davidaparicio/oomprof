@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"io"
 	"os"
+	"strings"
 )
 
 var (
@@ -55,7 +56,10 @@ func readBuildIDFromELF(f *os.File, ef *elf.File) (string, error) {
 
 			// Check for Go build ID
 			if nameSize == 4 && 16+valSize <= uint32(len(note)) && tag == elfGoBuildIDTag && bytes.Equal(nname, elfGoNote) {
-				return string(note[16 : 16+valSize]), nil
+				// Go build IDs are stored as C strings with a trailing NUL
+				// byte. valSize includes the terminator, so trim it to avoid
+				// passing NUL bytes through profile metadata.
+				return strings.TrimRight(string(note[16:16+valSize]), "\x00"), nil
 			}
 
 			// Check for GNU build ID
